@@ -15,3 +15,8 @@ build/
 .tmp/
 *.log
 
+
+# 本机令牌与本地覆盖，绝不入库
+.env
+.env.*
+!.env.example
