@@ -180,7 +180,10 @@ def ensure_token(data_dir: Path | str) -> tuple[str, str]:
     if from_env:
         return from_env, f"env:{TOKEN_ENV}"
     path = token_path(data_dir)
-    stored = read_token(path)
+    # 注意传的是**目录**：`read_token` 自己会拼 `TOKEN_FILE`。这里以前直接把文件路径递进去，
+    # 于是它去读 `data/token.json/token.json`，永远读不到 → 每次启动都换一把新口令，
+    # 桌面壳/Agent/MCP 手里的发现和界面 Cookie 全部对不上（401 循环）。
+    stored = read_token(data_dir)
     if stored:
         return stored, str(path)
     token = secrets.token_urlsafe(32)

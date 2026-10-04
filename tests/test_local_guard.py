@@ -152,14 +152,17 @@ class HttpBoundaryTests(unittest.TestCase):
 
     # ── (b) Host 判据 ──────────────────────────────────────────────────────────
     def test_rebound_host_is_refused_on_get_and_post(self):
-        for method, path, body in (("get", "/api/v1/tools", None),
-                                   ("post", "/api/v1/tools", {"name": "x", "command": ["C:\\x\\y.exe"]}),
-                                   ("get", "/health", None),
-                                   ("get", "/index.html", None)):
-            response = getattr(self.client, method)(path, json=body,
-                                                    headers={"Host": "evil.test:8794",
-                                                             "Origin": "http://evil.test:8794",
-                                                             "X-WorkflowHub-Token": self.token})
+        for method, path, body in (("GET", "/api/v1/tools", None),
+                                   ("POST", "/api/v1/tools", {"name": "x", "command": ["C:\\x\\y.exe"]}),
+                                   ("GET", "/health", None),
+                                   ("GET", "/index.html", None)):
+            # 用 `client.request(verb, …)` 而不是 `getattr(client, verb)(…, json=…)`：
+            # 后者对 GET 根本不存在 json 这个参数（httpx 的 get() 不接），一条从没跑过的
+            # 测试语句而已 —— 判据要落在同一条路径上，方法名不该替它说话。
+            response = self.client.request(method, path, json=body,
+                                           headers={"Host": "evil.test:8794",
+                                                    "Origin": "http://evil.test:8794",
+                                                    "X-WorkflowHub-Token": self.token})
             self.assertEqual(response.status_code, 403, f"{method.upper()} {path} 竟然接受了伪造 Host")
             self.assertEqual(response.headers["content-type"].split(";")[0], "application/json",
                              "拒绝要返 JSON 错误体（标准第 (c) 条后半）")
@@ -167,9 +170,17 @@ class HttpBoundaryTests(unittest.TestCase):
             self.assertIn("回环", response.json()["error"]["message"])
 
     def test_localhost_and_ipv6_loopback_hosts_are_accepted(self):
-        for base in ("http://localhost:8794", "http://[::1]:8794", LOCAL_BASE_URL):
-            client = TestClient(self.app, base_url=base)
-            self.assertEqual(client.get("/api/v1/tools").status_code, 200, f"{base} 应当被当作本机")
+        # `http://[::1]:8794` 这种 base_url 在本机的 starlette TestClient 上会先炸在
+        # 它自己的 netloc 解析上（`netloc.split(":", 1)` 把 `[::1]` 切坏，ValueError），
+        # 与被测判据无关。真实 uvicorn 收到的就是 Host 头那一个字面量，所以这里按 Host 头喂：
+        # 断言没变 —— IPv6 回环仍然必须被当作本机放行。
+        for label, base_url, headers in (
+                ("localhost", "http://localhost:8794", {}),
+                ("[::1]", LOCAL_BASE_URL, {"Host": "[::1]:8794"}),
+                ("127.0.0.1", LOCAL_BASE_URL, {})):
+            client = TestClient(self.app, base_url=base_url, headers=headers)
+            self.assertEqual(client.get("/api/v1/tools").status_code, 200,
+                             f"{label} 应当被当作本机：{headers or base_url}")
 
     def test_host_without_the_listening_port_is_refused(self):
         # 桌面端每次双击都是随机端口：判据取的是 ASGI scope 里那个**真实**端口
@@ -203,18 +214,20 @@ class HttpBoundaryTests(unittest.TestCase):
     # ── (d) 共享口令 ──────────────────────────────────────────────────────────
     def test_register_then_invoke_without_token_is_refused(self):
         """BLOCKER 1 的正身：登记一条命令再跑它，全程不带口令就必须一步都走不通。"""
-        registered = self.client.post("/api/v1/tools",
-                                      json={"name": "无口令登记", "command": ["C:\\Windows\\System32\\cmd.exe"]})
+        # 必须用 raw_client：`self.client` 是 local_client 造的那个**已经带着口令默认头**的
+        # 客户端，拿它当"无口令"客户端等于自己给自己发牌 —— 之前这里量到的是 200。
+        anonymous = raw_client(self.hub)
+        registered = anonymous.post("/api/v1/tools",
+                                    json={"name": "无口令登记", "command": ["C:\\Windows\\System32\\cmd.exe"]})
         self.assertEqual(registered.status_code, 401, "缺口令的 POST 竟然登记成功了")
         self.assertEqual(registered.json()["error"]["code"], "permission_error")
         self.assertNotIn("id", registered.json(), "401 的响应体不该带出一条新登记的记录")
 
         # 已经存在的工具也一样：拿夹具里那条低风险的 note-writer 来试 invoke
         key = next(k for k, t in self.hub.catalog.tools.items() if t.get("risk") != "high")
-        invoke = self.client.post(f"/api/v1/tools/{key}/invoke", json={"inputs": {"dry_run": True}})
+        invoke = anonymous.post(f"/api/v1/tools/{key}/invoke", json={"inputs": {"dry_run": True}})
         self.assertEqual(invoke.status_code, 401)
-        with_token = self.client.post(f"/api/v1/tools/{key}/invoke", json={"inputs": {"dry_run": True}},
-                                      headers={"X-WorkflowHub-Token": self.token})
+        with_token = self.client.post(f"/api/v1/tools/{key}/invoke", json={"inputs": {"dry_run": True}})
         self.assertEqual(with_token.status_code, 200, "带对口令就是同一条路，必须走得通")
 
     def test_wrong_token_is_refused_even_over_a_loopback_host(self):
@@ -244,14 +257,15 @@ class HttpBoundaryTests(unittest.TestCase):
 
     # ── (e) CORS ──────────────────────────────────────────────────────────────
     def test_no_wildcard_cors_header_anywhere(self):
-        for method, path, body in (("get", "/api/v1/tools", None),
-                                   ("post", "/api/v1/system/quit", None)):
-            response = getattr(self.client, method)(path, json=body,
-                                                    headers={"X-WorkflowHub-Token": self.token})
+        for method, path, body in (("GET", "/api/v1/tools", None),
+                                   ("POST", "/api/v1/system/quit", None)):
+            response = self.client.request(method, path, json=body,
+                                           headers={"X-WorkflowHub-Token": self.token})
             allow = response.headers.get("access-control-allow-origin")
             self.assertNotEqual(allow, "*", f"{path} 还在送 ACAO:*")
-        options = self.client.post("/api/v1/tools", json={"name": "x", "command": ["C:\\x.exe"]},
-                                   headers={"Origin": "http://evil.test"})
+        options = self.client.request("POST", "/api/v1/tools",
+                                      json={"name": "x", "command": ["C:\\x.exe"]},
+                                      headers={"Origin": "http://evil.test"})
         self.assertNotEqual(options.headers.get("access-control-allow-origin"), "*")
 
     # ── 交付默认（BLOCKER 1 的另一半） ────────────────────────────────────────
@@ -277,17 +291,20 @@ class HttpBoundaryTests(unittest.TestCase):
             try:
                 response = self.client.get("/api/v1/window/capture", params={"path": str(outside)},
                                            headers={"X-WorkflowHub-Token": self.token})
+                self.assertEqual(response.status_code, 422, "任意路径写点又回来了")
+                self.assertEqual(response.json()["error"]["code"], "permission_error")
+                self.assertFalse(outside.exists(), "被拒的请求还是把文件写到外面了")
+                self.assertEqual(fake.called, [])
+                # 放行那一半得在**同一个**桌面现场上量：以前这里先把 window 清空了才发第二条，
+                # 于是拿到的是"非桌面模式"的 200，`KeyError: path` —— 围堵过头还是没过头都没判到。
+                inside = self.client.get("/api/v1/window/capture",
+                                         params={"path": str(self.hub.roots["data"] / "shot.png")},
+                                         headers={"X-WorkflowHub-Token": self.token})
             finally:
                 self.app.state.window = None
-            self.assertEqual(response.status_code, 422, "任意路径写点又回来了")
-            self.assertEqual(response.json()["error"]["code"], "permission_error")
-            self.assertFalse(outside.exists(), "被拒的请求还是把文件写到外面了")
-            self.assertEqual(fake.called, [])
-            inside = self.client.get("/api/v1/window/capture",
-                                     params={"path": str(self.hub.roots["data"] / "shot.png")},
-                                     headers={"X-WorkflowHub-Token": self.token})
             self.assertEqual(inside.status_code, 200, f"围堵过头，data/ 里面也写不了了：{inside.json()}")
             self.assertTrue(Path(inside.json()["path"]).is_file())
+            self.assertEqual(len(fake.called), 1, "窗口该只被叫去写 data/ 里那一张")
 
     def test_files_endpoint_still_contains_and_reports_the_same_way(self):
         outside = str(Path(self.hub.roots["project"]).parent / "Windows" / "win.ini")
@@ -304,11 +321,17 @@ class HttpBoundaryTests(unittest.TestCase):
             app = create_app(self.hub)
             client = TestClient(app, base_url=LOCAL_BASE_URL,
                                 headers={"X-WorkflowHub-Token": token_of(app)})
-            response = client.post("/api/v1/tools/whatever/invoke",
-                                   content=b"x" * 4096,
-                                   headers={"content-type": "application/json"})
-            self.assertEqual(response.status_code, 413, f"超过上限的体没被挡住：{response.status_code}")
-            self.assertEqual(response.json()["error"]["details"]["max_body_bytes"], 4096)
+            # 判据是"超过上限"，那现场就得真的超过上限：原来这里发的正好是 4096 字节，
+            # 等于按自己的声明放行（量到的是路由的 422，不是闸门的 413）。
+            oversized = client.post("/api/v1/tools/whatever/invoke",
+                                    content=b"x" * 5000,
+                                    headers={"content-type": "application/json"})
+            self.assertEqual(oversized.status_code, 413,
+                             f"超过上限的体没被挡住：{oversized.status_code}")
+            self.assertEqual(oversized.json()["error"]["details"]["max_body_bytes"], 4096)
+            # 对照：闸门不是"一律拒 POST"—— 上限以内的体照样走到路由那一层。
+            inside = client.post("/api/v1/tools/whatever/invoke", json={"inputs": {}})
+            self.assertNotEqual(inside.status_code, 413, "上限以内的请求被同一条闸门一起挡了")
         finally:
             del os.environ["WORKFLOWHUB_MAX_BODY_BYTES"]
 

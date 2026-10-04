@@ -128,11 +128,17 @@ def create_app(hub: Hub | None = None) -> FastAPI:
     app.state.token_source = token_source
     app.state.max_body_bytes = max_body_bytes()
 
-    def denied(status: int, message: str, **details: Any) -> JSONResponse:
+    def denied(status: int, message: str, details: dict[str, Any] | None = None) -> JSONResponse:
+        """拒绝响应只有一个形状：`{"error": {code, message, retryable, details}}`（标准第 (c) 条后半）。
+
+        `details` 是一个**字典参数**，不是 `**kwargs`：两处调用点传的是 `{"host": …, "hint": …}`
+        这样的一份整体详情，按关键字摊开会把调用方写好的 details 拆成函数的形参，
+        当场 TypeError —— 守卫在最该说话的那一条分支上自己先炸掉。
+        """
         return JSONResponse({"error": {"code": "permission_error" if status == 403 else
                                        ("input_error" if status == 413 else "permission_error"),
                                        "message": message, "retryable": False,
-                                       "details": details}}, status_code=status)
+                                       "details": details or {}}}, status_code=status)
 
     @app.middleware("http")
     async def local_boundary(request: Request, call_next):
