@@ -81,17 +81,22 @@ class CatalogTests(unittest.TestCase):
     def test_high_risk_switch_gates_tools(self):
         custom = self.catalog.add_custom({"name": "shell helper", "command": ["C:\\Windows\\System32\\cmd.exe"],
                                           "risk": "high"})
-        self.assertTrue(self.catalog.is_enabled(custom["id"]))
+        # 交付默认就是"高风险不可调用"：手动登记的一条任意命令正落在这一档里。
+        self.assertFalse(self.catalog.is_enabled(custom["id"]),
+                         "high_risk_enabled 的交付默认必须是 False")
+        self.catalog.update_settings({"high_risk_enabled": True})
+        self.assertTrue(self.catalog.is_enabled(custom["id"]), "开关打开后要立刻可用")
+        row = self.catalog.record(custom["id"])
+        self.assertTrue(row["enabled"])
         self.catalog.update_settings({"high_risk_enabled": False})
         self.assertFalse(self.catalog.is_enabled(custom["id"]))
-        row = self.catalog.record(custom["id"])
-        self.assertFalse(row["enabled"])
-        self.catalog.update_settings({"high_risk_enabled": True})
-        self.assertTrue(self.catalog.is_enabled(custom["id"]))
 
     def test_approval_mode_lifecycle(self):
         key = self.catalog.add_custom({"name": "risky", "command": ["C:\\x\\powershell.exe"], "risk": "high"})["id"]
-        self.assertFalse(self.catalog.needs_approval(key))
+        # 交付默认 approval_mode=True：高风险工具先出审批单。
+        self.assertTrue(self.catalog.needs_approval(key), "approval_mode 的交付默认必须是 True")
+        self.catalog.update_settings({"approval_mode": False})
+        self.assertFalse(self.catalog.needs_approval(key), "关掉开关要立刻生效（这就是那条可选的放宽）")
         self.catalog.update_settings({"approval_mode": True})
         self.assertTrue(self.catalog.needs_approval(key))
         approval = self.catalog.create_approval(key, {"argv": ["-Command", "Get-Process"]}, "agent-x")
@@ -106,6 +111,9 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("approval_decided", kinds)
 
     def test_function_schema_shape(self):
+        # schema 只列**已启用**的工具，而交付默认关着高风险 —— 这条测的是 schema 形状，
+        # 不是门；先按用户那一步把开关打开（门的默认值由上面两条与本文件的守卫钉住）。
+        self.catalog.update_settings({"high_risk_enabled": True})
         skill_id = self.catalog.to_skill("script-tools-report-tool").id
         schema = self.catalog.agent_tool_schema()
         self.assertTrue(schema)

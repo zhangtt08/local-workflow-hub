@@ -42,10 +42,15 @@ def _atomic_write(path: Path, payload: Any) -> None:
     atomic_replace(tmp, path)
 
 
+#: 交付默认值。两条都是从"能用"改成"默认安全"，改回来的开关写在 README「安全边界」一节，
+#: 只在那一处解释，别处不再复述：
+#: * ``approval_mode=True`` —— 高风险工具先出审批单，人在窗口里点了头才真跑；
+#: * ``high_risk_enabled=False`` —— 扫描到的/手动登记的高风险命令默认**不可调用**，
+#:   要用先在设置里打开（`POST /api/v1/tools` 登记的那类任意命令就落在这一档里）。
 DEFAULT_SETTINGS: dict[str, Any] = {
     "scan_roots": [str(p) for p in DEFAULT_ROOTS],
-    "approval_mode": False,
-    "high_risk_enabled": True,
+    "approval_mode": True,
+    "high_risk_enabled": False,
     "max_output_bytes": 200_000,
     "default_timeout_seconds": 120,
     # 并发是明说的策略而不是巧合：默认允许同一个工具被同时调用（这台机器上多数命令互不相干）。
@@ -54,9 +59,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "telemetry": False,
 }
 
-#: 审计索引一次最多读这么多字节；超过就只索引尾部并在 stats 里如实标出来，
+#: 审计一次最多读这么多字节；超过就只索引尾部并在 stats 里如实标出来，
 #: 免得一次几个 GB 的 audit.jsonl 把启动与健康检查拖死（这条是这个项目自己踩过的）。
 AUDIT_SCAN_LIMIT = 32_000_000
+#: 审计文件的**硬上限**：到顶就轮转（改名留底 + 从头再写）。不轮转的话这台机器上
+#: 实测会一路涨到几百 MB，而每一次读都要按上面的窗口重算，界面上的"最近活动"越来越慢。
+AUDIT_ROTATE_AT = 32_000_000
+#: 轮转后留在磁盘上的历史份数（audit.jsonl.1 是上一轮，.2 更早……）
+AUDIT_KEEP = 3
 #: recent_activity 在内存里保留的行数
 AUDIT_ROWS_KEPT = 2_000
 
@@ -85,6 +95,10 @@ class ToolCatalog:
         self._audit_rows_buf: list[dict[str, Any]] = []
         self._audit_index_buf: dict[str, tuple[int, str | None]] = {}
         self._audit_pos = 0
+        # 跨轮转的累计计数（当前那一本的计数在 _audit_index_buf 里，两份相加才是总次数）
+        self._audit_counts_path = self.root / "audit.counts.json"
+        self._audit_counts: dict[str, tuple[int, str | None]] = {}
+        self._audit_counts_loaded = False
         # 必须在构造里就初始化：_audit_reset() 只在"文件不存在/被截断"那两条分支上才会跑到。
         # 真实机器上 data/audit.jsonl 是一直存在的，于是第一次 _audit_tail() 直接读这个属性就
         # AttributeError —— 测试里用临时空目录躲过了，凡是读调用计数的端点（含 /api/agent/tools）
@@ -495,10 +509,15 @@ class ToolCatalog:
 
     # ── audit + approvals ──────────────────────────────────────────────────────
     def audit(self, event: dict[str, Any]) -> None:
-        """写一条审计：**先脱敏再落盘**。
+        """写一条审计：**先脱敏再落盘**，到顶就轮转。
 
         审计文件是给人读的，也会从 /api/v1/activity 与工具详情页返回；env 的值与密钥形状的参数
         只该出现在真正执行的那一份里，不该出现在账本里。
+
+        轮转（第 4 号 NICE：以前这本账只增不减，实测涨到几百 MB 后每次读都要按窗口重算）：
+        写到 `AUDIT_ROTATE_AT` 就改名留底、从头再写，最多留 `AUDIT_KEEP` 份。
+        **计数不会因为轮转而归零** —— 轮转前把当前文件的每工具计数并进
+        `audit.counts.json`（跨轮转的累计值），`invocation_count()` 读的是两份之和。
         """
         record = redact_event({"at": _now(), **event})
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -506,6 +525,43 @@ class ToolCatalog:
         with self._audit_lock:
             with self.audit_path.open("a", encoding="utf-8") as stream:
                 stream.write(line)
+            try:
+                oversized = self.audit_path.stat().st_size >= AUDIT_ROTATE_AT
+            except OSError:
+                oversized = False
+            if oversized:
+                self._audit_rotate_locked()
+
+    def _audit_rotate_locked(self) -> None:
+        """轮转审计文件。调用方必须已持有 `_audit_lock`。"""
+        # 先把当前这一本的计数并进累计值，再动磁盘 —— 顺序反了就把这一段历史数丢了
+        totals = self._audit_rotated_totals()
+        for tool, (count, at) in self._audit_index().items():
+            previous, last = totals.get(tool, (0, None))
+            totals[tool] = (previous + count, max(str(at or ""), str(last or "")) or None)
+        self._audit_counts_path.write_text(json.dumps(totals, ensure_ascii=False), encoding="utf-8")
+        for index in range(AUDIT_KEEP, 0, -1):        # .2 <- .1 <- 当前那份
+            source = self.audit_path if index == 1 else self.audit_path.with_suffix(f".jsonl.{index - 1}")
+            target = self.audit_path.with_suffix(f".jsonl.{index}")
+            if target.exists():
+                target.unlink()
+            if source.exists():
+                source.replace(target)
+        self._audit_reset()                            # 内存视图跟着归零，计数走 totals
+        self._audit_counts_loaded = True
+
+    def _audit_rotated_totals(self) -> dict[str, tuple[int, str | None]]:
+        """`audit.counts.json` 里"已经被轮转走的那几本"的累计计数。"""
+        if self._audit_counts_loaded:
+            return self._audit_counts
+        self._audit_counts_loaded = True
+        try:
+            raw = json.loads(self._audit_counts_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+        self._audit_counts = {str(k): (int(v[0] or 0), v[1] if len(v) > 1 else None)
+                              for k, v in raw.items() if isinstance(v, (list, tuple))}
+        return self._audit_counts
 
     def _audit_rows(self, limit: int = 400) -> list[dict[str, Any]]:
         return list(reversed(self._audit_tail()))[:limit]
@@ -601,22 +657,34 @@ class ToolCatalog:
         return self._audit_index_buf
 
     def audit_stats(self) -> dict[str, Any]:
-        """审计这本账本身：多大、内存里留了几行、计数是不是只看了尾部。"""
+        """审计这本账本身：多大、内存里留了几行、计数是不是只看了尾部、轮转过没有。"""
         rows = self._audit_tail()
         try:
             size = int(self.audit_path.stat().st_size)
         except OSError:
             size = 0
+        archived = [str(p.name) for p in self.root.glob("audit.jsonl.*")]
+        carried = self._audit_rotated_totals()
         return {"bytes": size, "rows_in_memory": len(rows), "tools_counted": len(self._audit_index_buf),
                 "windowed": bool(self._audit_windowed),
+                "rotate_at_bytes": AUDIT_ROTATE_AT, "rotated_archives": sorted(archived),
+                "tools_counted_in_archives": len(carried),
+                "counts_file": str(self._audit_counts_path),
                 "note": ("审计文件超过 32MB，计数只覆盖尾部窗口" if self._audit_windowed
-                         else "调用次数按 audit.jsonl 全量统计")}
+                         else "调用次数 = 当前这本 + 已轮转那几本的累计值")}
 
     def invocation_count(self, key: str) -> int:
-        return self._audit_index().get(key, (0, None))[0]
+        current = self._audit_index().get(key, (0, None))[0]
+        return current + self._audit_rotated_totals().get(key, (0, None))[0]
 
     def last_invocation(self, key: str) -> str | None:
-        return self._audit_index().get(key, (0, None))[1]
+        current = self._audit_index().get(key, (0, None))[1]
+        carried = self._audit_rotated_totals().get(key, (0, None))[1]
+        return max(str(current or ""), str(carried or "")) or None
+
+    def rotated_totals(self) -> dict[str, tuple[int, str | None]]:
+        """已被轮转走的那几本里的累计计数（测试与 stats 读这一份）。"""
+        return dict(self._audit_rotated_totals())
 
     def recent_activity(self, limit: int = 40, tool: str | None = None, actor: str | None = None,
                         event_type: str | None = None) -> list[dict[str, Any]]:

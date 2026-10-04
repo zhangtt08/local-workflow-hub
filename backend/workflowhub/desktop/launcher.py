@@ -22,6 +22,7 @@ import uvicorn
 
 from ..api import create_app
 from ..bootstrap import build_hub, static_root
+from ..local_guard import publish_endpoint, retire_endpoint
 from .window import WindowController, find_window, make_dpi_aware
 
 BROWSER_SLOTS = (
@@ -106,12 +107,21 @@ def existing_instance(data_dir: Path) -> dict[str, Any] | None:
 
 
 def focus_instance(info: dict[str, Any]) -> bool:
+    """把已有实例的窗口带到前面 —— 这是**非 GET**，所以必须带本机共享口令。
+
+    口令从它自己写的 `data/desktop.json` 里读（同一个二进制、同一台机器、同一个用户，
+    读得到；浏览器读不到）。不带口令的第二次双击只会得到 401，然后表现为"没反应"。
+    """
     try:
         import urllib.request
 
         body = json.dumps({"action": "focus"}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        token = str(((info.get("auth") or {}).get("token")) or "")
+        if token:
+            headers["X-WorkflowHub-Token"] = token
         request = urllib.request.Request(f"http://127.0.0.1:{info['port']}/api/v1/window/action",
-                                         data=body, headers={"Content-Type": "application/json"}, method="POST")
+                                         data=body, headers=headers, method="POST")
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(request, timeout=2.0) as response:
             return bool(json.loads(response.read().decode("utf-8")).get("ok"))
@@ -292,6 +302,9 @@ def run_desktop(host: str = "127.0.0.1", port: int | None = None, start: str = "
         wanted = os.environ.get("WORKFLOWHUB_PORT", "").strip()
         port = int(wanted) if wanted.isdigit() and 1024 <= int(wanted) <= 65535 else None
     app = create_app(hub)
+    # 口令由 create_app 保证存在（没有就当场生成并落盘）；这里把它挂回 hub，
+    # `publish_endpoint` 与后面的自检都读同一份，不再各自算一遍。
+    hub.token = str(getattr(app.state, "token", ""))
     server, thread, chosen_port, why, _ = serve_ready(app, hub.instance, host, preferred=port)
     if server is None or thread is None:
         print(f"本地服务启动失败：{why or '健康检查超时'}")
@@ -341,10 +354,8 @@ def run_desktop(host: str = "127.0.0.1", port: int | None = None, start: str = "
             os.startfile(target)  # noqa: S606
         except OSError:
             print("请手动在浏览器打开上面的地址")
-        endpoint = hub.roots["data"] / "desktop.json"
-        endpoint.write_text(json.dumps({"url": target, "port": chosen_port, "pid": os.getpid(),
-                                       "window": None, "fallback": reason, "started_at": time.time()},
-                                       ensure_ascii=False, indent=1), encoding="utf-8")
+        publish_endpoint(hub, port=chosen_port, url=target, pid=os.getpid(),
+                         extra={"window": None, "fallback": reason})
         try:
             while not stopper.exists():
                 time.sleep(0.5)
@@ -352,7 +363,7 @@ def run_desktop(host: str = "127.0.0.1", port: int | None = None, start: str = "
             pass
         finally:
             stopper.unlink(missing_ok=True)
-            endpoint.unlink(missing_ok=True)
+            retire_endpoint(hub)
             server.should_exit = True
         return 0
 
@@ -366,10 +377,8 @@ def run_desktop(host: str = "127.0.0.1", port: int | None = None, start: str = "
         controller.maximized = False
         controller._apply(controller.visible)
     app.state.window = controller
-    endpoint = hub.roots["data"] / "desktop.json"
-    endpoint.write_text(json.dumps({"url": target, "port": chosen_port, "pid": process.pid,
-                                   "window": controller.state(), "started_at": time.time()},
-                                   ensure_ascii=False, indent=1), encoding="utf-8")
+    publish_endpoint(hub, port=chosen_port, url=target, pid=process.pid,
+                     extra={"window": controller.state()})
     hub.catalog.audit({"type": "desktop_window", "actor": "desktop", "hwnd": controller.hwnd,
                        "status": "attached", "command_line": " ".join([str(a) for a in process.args])})
 
@@ -384,7 +393,7 @@ def run_desktop(host: str = "127.0.0.1", port: int | None = None, start: str = "
     except KeyboardInterrupt:
         pass
     finally:
-        (hub.roots["data"] / "desktop.json").unlink(missing_ok=True)
+        retire_endpoint(hub)
         clear_stop_marker(hub.roots["data"])   # 界面退出按钮写的标记不能留给下一次启动
         app.state.window = None
         server.should_exit = True

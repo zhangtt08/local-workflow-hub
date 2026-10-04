@@ -30,6 +30,17 @@ def example() -> WorkflowDefinition:
 
 
 class ContractTests(unittest.TestCase):
+    def test_failed_version_write_does_not_leave_an_immutable_partial_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repo = FileWorkflowRepository(Path(folder))
+            workflow = example()
+            with mock.patch("workflowhub.persistence.os.fsync", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    repo.save_version(workflow)
+            self.assertIsNone(repo.get_version(workflow.id, workflow.version))
+            repo.save_version(workflow)
+            self.assertEqual(repo.get_version(workflow.id, workflow.version), workflow)
+
     def test_skill_validation(self):
         registry = DirectorySkillRegistry(PROJECT_ROOT / "skills")
         registry.refresh()

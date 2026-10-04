@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -54,7 +55,14 @@ class FileWorkflowRepository:
         content = workflow.model_dump_json(indent=2)
         try:
             with path.open("x", encoding="utf-8") as stream:
-                stream.write(content)
+                try:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                except BaseException:
+                    stream.close()
+                    path.unlink(missing_ok=True)
+                    raise
             return
         except FileExistsError:
             existing = WorkflowDefinition.model_validate_json(path.read_text(encoding="utf-8"))

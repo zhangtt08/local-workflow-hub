@@ -27,8 +27,28 @@ def _print(payload: Any) -> None:
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
+    from .api import create_app
+    from .local_guard import LOOPBACK_HOSTS, publish_endpoint, retire_endpoint
+
+    if args.host not in LOOPBACK_HOSTS:
+        # 共享验收标准第 (a) 条：本机服务只许监听 127.0.0.1。
+        # 绑到 0.0.0.0 上就等于把"任意本机命令"交给整个局域网，
+        # Host/Origin 那两道判据挡不住直接按 IP 打过来的客户端。
+        print(f"只允许绑定回环地址，收到 {args.host}；要用别的地址请自己加反向代理，"
+              f"并把代理的主机名写进 WORKFLOWHUB_ALLOWED_HOSTS")
+        return 2
     os.environ.setdefault("WORKFLOWHUB_SERVE", "1")
-    uvicorn.run("workflowhub.api:app", host=args.host, port=args.port, reload=False, log_level="info")
+    hub = build_hub()
+    app = create_app(hub)
+    hub.token = str(getattr(app.state, "token", ""))
+    publish_endpoint(hub, port=args.port, url=f"http://{args.host}:{args.port}/",
+                     pid=os.getpid(), extra={"mode": "serve"})
+    try:
+        # 传 app 对象而不是 "workflowhub.api:app" 字符串：后者会让 uvicorn 再 import 一次
+        # 模块并**第二次** build_hub()（对真实 data/ 目录多开一份 1,500 条的目录）。
+        uvicorn.run(app, host=args.host, port=args.port, reload=False, log_level="info")
+    finally:
+        retire_endpoint(hub)
     return 0
 
 

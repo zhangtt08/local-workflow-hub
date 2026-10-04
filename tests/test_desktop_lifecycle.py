@@ -16,6 +16,8 @@ from workflowhub.api import create_app
 from workflowhub.bootstrap import build_hub
 from workflowhub.desktop.launcher import clear_stop_marker, existing_instance, focus_instance, serve_ready, wait_for_server
 
+from local_client import local_client
+
 
 class NoopResponder(threading.Thread):
     """假装是 WorkflowHub、其实不是的本地端口：这台机器上真有这么一层会吞连接的东西。"""
@@ -59,7 +61,7 @@ class ReadinessTests(unittest.TestCase):
             return int(probe.getsockname()[1])
 
     def test_health_carries_this_instance(self):
-        client = TestClient(create_app(self.hub))
+        client = local_client(self.hub)
         self.assertEqual(client.get("/health").json()["instance"], self.hub.instance)
         self.assertNotEqual(self.hub.instance, build_hub(Path(tempfile.mkdtemp())).instance)
 
@@ -115,7 +117,7 @@ class SingleInstanceTests(unittest.TestCase):
     def test_quit_endpoint_writes_the_stop_marker(self):
         with tempfile.TemporaryDirectory() as folder:
             hub = build_hub(Path(folder))
-            client = TestClient(create_app(hub))
+            client = local_client(hub)
             marker = hub.roots["data"] / "desktop.stop"
             self.assertFalse(marker.exists())
             result = client.post("/api/v1/system/quit").json()

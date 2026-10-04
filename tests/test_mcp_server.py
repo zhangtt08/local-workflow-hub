@@ -17,6 +17,7 @@ from workflowhub.bootstrap import build_hub
 from workflowhub.mcp_server import META_TOOLS, Handler, serve_stdio  # noqa: F401
 
 from test_discovery import fixtures
+from local_client import unlock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,6 +32,9 @@ class HandlerTests(unittest.TestCase):
         cls.hub = build_hub(cls.root / "data")
         cls.hub.catalog.scan([str(cls.root / "machine")])
         cls.hub.registry.refresh()
+        # MCP 是同一套服务层的另一个入口，判据完全一样：交付默认下高风险工具不可调用，
+        # 这一组用例测的是调用回路，所以先把用户那一步开关打开（见 tests/local_client.py）。
+        unlock(cls.hub)
         cls.handler = Handler(cls.hub)
 
     @classmethod

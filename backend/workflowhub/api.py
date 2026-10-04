@@ -15,8 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -25,8 +24,33 @@ from .bootstrap import Hub, build_hub, resource_dir, static_root
 from .catalog import DEFAULT_SETTINGS
 from .errors import WorkflowHubError
 from .legacy_agent_api import create_router as legacy_router
+from .local_guard import (SESSION_COOKIE, TOKEN_HEADER, ensure_token, host_problem,
+                          max_body_bytes, origin_problem, require_within, token_matches,
+                          token_path)
 from .models import ErrorCode, WorkflowDefinition
+from .redaction import redact_wire
 from . import services
+
+#: 会改东西的方法：这些才要口令（共享标准 (d)：非 GET 一律验口令）
+_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _bound_port(request: Request) -> int | None:
+    """这个进程**真的**绑在哪个端口 —— 取自 ASGI scope，不读配置。
+
+    桌面端每次双击都是随机端口，把期望端口写死在配置里就会判错；uvicorn 与
+    `TestClient(base_url=…)` 都会把真实绑定地址填进 `scope["server"]`。
+    只有 server host 本身是回环字面量时才拿它当基准（`TestClient` 默认 host 是
+    "testserver"，那种情况下端口不可信，但 Host 那条判据已经会先拒掉它）。
+    """
+    server = request.scope.get("server") or ()
+    if len(server) >= 2 and str(server[0]).lower() in {"127.0.0.1", "localhost", "::1"}:
+        try:
+            port = int(server[1])
+        except (TypeError, ValueError):
+            return None
+        return port or None
+    return None
 
 
 class InvokeRequest(BaseModel):
@@ -70,6 +94,11 @@ class ApprovalDecision(BaseModel):
     actor: str = "user"
 
 
+def _readable_roots(hub: Hub) -> list[Path]:
+    """data/ 与 skills/：读文件与写截图共用这一份名单。"""
+    return [hub.roots["data"].resolve(), (hub.roots["project"] / "skills").resolve()]
+
+
 def error_payload(exc: WorkflowHubError) -> dict[str, Any]:
     return {"error": exc.detail.model_dump(mode="json")}
 
@@ -86,20 +115,105 @@ def create_app(hub: Hub | None = None) -> FastAPI:
                 pass
     app = FastAPI(title="WorkflowHub", version=hub.version(),
                   description="本机工具与Workflow编排中心，面向 AI Agent 直接调用")
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    # 这里**不再**挂 CORSMiddleware。改之前是 allow_origins=["*"] + allow_headers=["*"]：
+    # 界面与自己是同源的，根本不需要 CORS，而"任何源都可以"等于把 1,529 个本机能力
+    # 交给浏览器里打开的任何一个网页（共享标准第 (e) 条：状态变更路由永不允许 `*`）。
+    # 需要给别的源开读权限时用 WORKFLOWHUB_ALLOWED_HOSTS 显式加白，判据见 local_guard。
     app.state.hub = hub
     app.state.window = None
-    token = os.environ.get("WORKFLOWHUB_TOKEN", "").strip()
+    # 口令默认**必配**：没有环境变量就在首次启动时生成一把，落盘（0600）后再也不变。
+    # 之前是"配了才校验"，而默认是没配 —— 于是那条校验从来没生效过。
+    token, token_source = ensure_token(hub.roots["data"])
+    app.state.token = token
+    app.state.token_source = token_source
+    app.state.max_body_bytes = max_body_bytes()
+
+    def denied(status: int, message: str, **details: Any) -> JSONResponse:
+        return JSONResponse({"error": {"code": "permission_error" if status == 403 else
+                                       ("input_error" if status == 413 else "permission_error"),
+                                       "message": message, "retryable": False,
+                                       "details": details}}, status_code=status)
 
     @app.middleware("http")
-    async def bearer(request: Request, call_next):
-        if token and request.url.path.startswith("/api/") and request.url.path != "/health":
-            provided = request.headers.get("x-workflowhub-token", "")
-            if provided != token:
-                return JSONResponse({"error": {"code": "permission_error",
-                                               "message": "缺少 X-WorkflowHub-Token", "details": {}}},
+    async def local_boundary(request: Request, call_next):
+        """本机边界 + 共享口令 + 出口脱敏：一个点上判完，不指望每个路由自己记得。
+
+        四道判据（对应共享验收标准 a–e，逐条解释写在 `local_guard.py` 的模块文档里）：
+        ① Host 必须是字面量回环 + 本服务真实监听的端口（DNS rebinding 下 Host 就是那个
+           恶意域名，直接拒 —— 拿 Origin 和请求自己的 Host 比才是这次的 bug）；
+        ② Origin / Referer 存在时必须与 Host 同一个 host:port；
+        ③ 非 GET 必须带共享口令（timing-safe 比较）：走 Cookie 的那条额外要求 Origin 相等，
+           因为 Cookie 按域名共享而**不按端口**共享；
+        ④ 响应出网前过 `redact_wire()`：命令行、日志、stdout 回声、存下来的 inputs 全遮。
+        """
+        host = request.headers.get("host", "")
+        bound = _bound_port(request)
+        problem = host_problem(host, bound_port=bound)
+        if problem:
+            return denied(403, f"这个服务只接受本机回环地址的调用：{problem}",
+                          {"host": host, "hint": "要经反向代理访问请设 WORKFLOWHUB_ALLOWED_HOSTS"})
+        origin = request.headers.get("origin", "")
+        referer = request.headers.get("referer", "")
+        for label, value in (("Origin", origin), ("Referer", referer)):
+            bad = origin_problem(value, host) if value else ""
+            if bad:
+                return denied(403, f"跨源调用被拒（{label}）：{bad}",
+                              {label.lower(): value, "hint": "只有本机浏览器里的界面与本机的 "
+                                                              "X-WorkflowHub-Token 调用方可以写入"})
+        if request.method.upper() in _WRITE_METHODS:
+            declared = (request.headers.get("content-length") or "").strip()
+            cap = app.state.max_body_bytes
+            if declared.isdigit() and int(declared) > cap:
+                return JSONResponse({"error": {"code": "input_error", "retryable": False,
+                                               "message": f"请求体超过上限 {cap} 字节（收到 {declared}）",
+                                               "details": {"max_body_bytes": cap}}},
+                                    status_code=413)
+            header_token = request.headers.get(TOKEN_HEADER, "")
+            cookie_token = request.cookies.get(SESSION_COOKIE, "")
+            if header_token:
+                granted = token_matches(header_token, token)
+            elif cookie_token:
+                # 界面上没有地方填口令，所以口令由服务在已通过 ①② 的回环请求上发给它。
+                # 这条路多要一条：Origin 必须逐字等于 Host —— 同机另一个端口的网页本来能
+                # 白骑这个 Cookie（Cookie 不按端口共享），那一条正好把它挡掉。
+                granted = (token_matches(cookie_token, token) and bool(origin)
+                           and not origin_problem(origin, host))
+            else:
+                granted = False
+            if not granted:
+                return JSONResponse({"error": {"code": "permission_error", "retryable": False,
+                                               "message": f"缺少 {TOKEN_HEADER}（本机共享口令）。"
+                                                          "口令在 data/token.json 与 "
+                                                          "data/agent-endpoint.json 里",
+                                               "details": {"header": TOKEN_HEADER,
+                                                           "token_file": str(token_path(hub.roots["data"]))}}},
                                     status_code=401)
-        return await call_next(request)
+
+        response = await call_next(request)
+        # 回环且同源才发这把 Cookie：HttpOnly 让页面脚本读不到，SameSite=Strict 让别的站
+        # 发起的请求根本带不上它 —— 口令因此只服务于"用户自己打开的那个界面"。
+        carry = {SESSION_COOKIE: token} if request.method.upper() == "GET" else {}
+        content_type = response.headers.get("content-type", "")
+        if "application/json" not in content_type:
+            for name, value in carry.items():
+                response.set_cookie(name, value, httponly=True, samesite="strict", path="/")
+            return response
+        chunks = [chunk async for chunk in response.body_iterator]
+        body = b"".join(chunks)
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            for name, value in carry.items():
+                response.set_cookie(name, value, httponly=True, samesite="strict", path="/")
+            return response
+        cleaned = json.dumps(redact_wire(payload), ensure_ascii=False).encode("utf-8")
+        headers = dict(response.headers)
+        headers.pop("content-length", None)
+        out = Response(content=cleaned, status_code=response.status_code, headers=headers,
+                       media_type=content_type)
+        for name, value in carry.items():
+            out.set_cookie(name, value, httponly=True, samesite="strict", path="/")
+        return out
 
     @app.exception_handler(WorkflowHubError)
     async def hub_error(_: Request, exc: WorkflowHubError):
@@ -146,7 +260,9 @@ def create_app(hub: Hub | None = None) -> FastAPI:
         return {
             "name": "WorkflowHub", "version": hub.version(), "base_url": base,
             "protocol": ["rest-json", "mcp-stdio", "function-calling-schema"],
-            "auth": {"required": bool(token), "header": "X-WorkflowHub-Token" if token else None},
+            "auth": {"required": True, "header": TOKEN_HEADER,
+                     "file": "data/token.json（首次启动自动生成；本机调用方从这里读，网页读不到）",
+                     "discovery": "data/agent-endpoint.json 与 data/desktop.json 里带同一把口令"},
             "counts": {"catalogue": hub.catalog.facets()["total"], "enabled": hub.catalog.facets()["enabled"],
                        "handwritten_skills": len(hub.directory.list()), "workflows": len(services.list_workflows(hub))},
             "endpoints": {
@@ -346,6 +462,11 @@ def create_app(hub: Hub | None = None) -> FastAPI:
         if changed:
             # 改开关是要留痕的动作：谁把高风险放开、谁把审批关掉，事后要查得回
             hub.catalog.audit({"type": "settings", "actor": actor, "changed": changed})
+        if "high_risk_enabled" in changed:
+            # 注册表里放的是"当前可调用"的 Skill 快照，而高风险开关决定一批工具进不进得来。
+            # 不刷新就会出这种形状：界面上开关明明打开了，调用却报 unknown Skill
+            # （交付默认改成 False 之后这条路每天都走，以前是默认 True 才没人撞上）。
+            hub.registry.refresh()
         return {"settings": after, "changed": sorted(changed)}
 
     @app.get("/api/v1/activity")
@@ -443,7 +564,9 @@ def create_app(hub: Hub | None = None) -> FastAPI:
 
     @app.get("/api/v1/workflows")
     def workflows() -> dict[str, Any]:
-        return {"items": services.list_workflows(hub)}
+        report = services.list_workflows_report(hub)
+        return {"items": report["items"], "skipped": report["skipped"],
+                "note": "skipped 非空说明 data/workflows 里有读不出来的档：路径与原因都在里面，不是少一条就完了"}
 
     @app.get("/api/v1/workflows/{workflow_id}")
     def get_workflow(workflow_id: str, version: int = 1) -> dict[str, Any]:
@@ -465,7 +588,9 @@ def create_app(hub: Hub | None = None) -> FastAPI:
 
     @app.get("/api/v1/runs")
     def runs(limit: int = 25, status: str | None = None) -> dict[str, Any]:
-        return {"items": services.list_runs(hub, limit, status)}
+        report = services.list_runs_report(hub, limit, status)
+        return {"items": report["items"], "skipped": report["skipped"],
+                "note": "skipped 非空说明 data/runs 里有坏 JSON：报路径与原因，不静默跳过"}
 
     @app.get("/api/v1/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
@@ -479,18 +604,21 @@ def create_app(hub: Hub | None = None) -> FastAPI:
 
     @app.get("/api/v1/files")
     def read_file(path: str, download: bool = False) -> Any:
-        target = Path(path).resolve()
-        allowed = [hub.roots["data"].resolve(), (hub.roots["project"] / "skills").resolve()]
-        if not any(target.is_relative_to(root) for root in allowed):
-            raise WorkflowHubError(ErrorCode.PERMISSION_ERROR, "只能读取 data/ 或 skills/ 内的文件",
-                                   {"path": str(target)})
+        # 围堵判据只有一份（`local_guard.require_within`）：/window/capture 那个写点
+        # 走的是同一把尺，改一处两边都改，别再各写一遍。
+        target = require_within(path, _readable_roots(hub), what="文件")
         if not target.is_file():
             raise not_found("文件", str(target))
         if download:
             return FileResponse(target, filename=target.name)
-        text = target.read_text(encoding="utf-8", errors="replace")
-        return {"path": str(target), "size": target.stat().st_size, "text": text[:200_000],
-                "truncated": len(text) > 200_000}
+        limit = 200_000
+        # 先按上限**读那么多**再判断有没有更多，而不是整份读进内存再切：
+        # 界面会拿这个端点看日志，而 data/ 里躺着的可能是几百 MB 的 events.jsonl。
+        with target.open("r", encoding="utf-8", errors="replace") as stream:
+            text = stream.read(limit + 1)
+        truncated = len(text) > limit
+        return {"path": str(target), "size": target.stat().st_size,
+                "text": text[:limit], "truncated": truncated}
 
     # ── system ─────────────────────────────────────────────────────────────
     @app.get("/api/v1/system/info")
@@ -543,10 +671,18 @@ def create_app(hub: Hub | None = None) -> FastAPI:
 
     @app.get("/api/v1/window/capture")
     def window_capture(path: str = "") -> dict[str, Any]:
+        """把窗口截到 data/ 里的一个文件上 —— 路径围堵与 /api/v1/files 同一把尺。
+
+        改之前这里是 `Path(path)` 直接交给 `window.capture()`，也就是"任意路径写"：
+        配合当时那条宽松的跨源判据，一个网页就能往 `启动\\` 里放一个可执行文件
+        （第 3 号 BLOCKER）。留 `path` 参数只为兼容界面里的"存到别处"入口，
+        越界就当场 403 并且**一个字节都不写**。
+        """
         controller = window()
         if controller is None:
             return {"ok": False, "reason": "非桌面模式"}
-        target = Path(path) if path else hub.roots["data"] / "window.png"
+        target = (require_within(path, [hub.roots["data"]], what="截图") if path
+                  else hub.roots["data"] / "window.png")
         return {"ok": controller.capture(target), "path": str(target)}
 
     @app.post("/api/v1/system/quit")

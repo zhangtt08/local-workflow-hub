@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from workflowhub.api import create_app
 from workflowhub.bootstrap import build_hub
 
+from local_client import local_client
 from test_discovery import fixtures
 
 TOOL = "script-tools-report-tool"
@@ -29,7 +30,9 @@ class AgentApiTests(unittest.TestCase):
         cls.hub = build_hub(cls.root / "data")
         cls.hub.catalog.scan([str(cls.machines)])
         cls.hub.registry.refresh()
-        cls.client = TestClient(create_app(cls.hub))
+        # 走"本机正当调用方"那一条路：回环 Host + 共享口令（tests/local_client.py）
+        cls.client = local_client(cls.hub)
+        cls.app = cls.client.app
 
     @classmethod
     def tearDownClass(cls):
@@ -119,14 +122,20 @@ class AgentApiTests(unittest.TestCase):
     def test_08_approval_mode_gates_high_risk(self):
         risky = self.client.post("/api/v1/tools", json={"name": "gate", "risk": "high",
                                                         "command": ["C:\\x\\powershell.exe"]}).json()
-        self.client.put("/api/v1/settings", json={"patch": {"approval_mode": True}})
+        # 交付默认是 high_risk_enabled=False —— 高风险工具连"能不能调用"这一关都还没过，
+        # 所以要测审批那道门，得先把高风险开关打开（这正是用户真实会做的两步）。
+        self.client.put("/api/v1/settings", json={"patch": {"high_risk_enabled": True,
+                                                            "approval_mode": True}})
         pending = self.client.post(f"/api/v1/tools/{risky['id']}/invoke", json={"inputs": {}}).json()
         self.assertEqual(pending["status"], "awaiting_approval")
         token = pending["approval"]["id"]
         self.assertIn(token, [a["id"] for a in self.client.get("/api/v1/approvals").json()["pending"]])
         decided = self.client.post(f"/api/v1/approvals/{token}/decide", json={"approve": True}).json()
         self.assertEqual(decided["status"], "approved")
-        self.client.put("/api/v1/settings", json={"patch": {"approval_mode": False}})
+        self.client.put("/api/v1/settings", json={"patch": {"approval_mode": False,
+                                                            "high_risk_enabled": True}})
+        # 收尾恢复的是**本类夹具**那一档（local_client 已经把高风险放开），不是交付默认 ——
+        # 留成 False 会让后面的用例撞在"工具未启用"上，而那与这条测试想验的东西无关。
 
     def test_09_schema_and_openapi(self):
         schema = self.client.get("/api/v1/tools.json").json()

@@ -1,0 +1,61 @@
+def _restrict_local_file(path: Path) -> None:
+    """尽力收紧到"只有本人可读写"（Windows 上只能设只读位，真边界是用户目录的 NTFS ACL）。"""
+    try:
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def publish_endpoint(hub: Any, *, port: int, url: str, pid: int,
+                     extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """把"实际地址 + 本机口令"写给调用方：`data/desktop.json`、`data/agent-endpoint.json`、
+    以及统一标准里的 `agent/.endpoint`。
+
+    为什么写在这里而不是让用户去配环境变量（第 1 号 BLOCKER 的"零配置"那半条）：桌面端每次
+    双击都是**随机端口**，口令又是首次启动生成的，这两件事用户都不该知道 —— 他双击就能用。
+    而网页拿不到这个文件：同源策略读不了本地磁盘，跨源请求又先被 Host/Origin 判据拒掉。
+    三处写的是同一把口令，别让它分叉。
+    """
+    token = str(getattr(hub, "token", "") or ensure_token(hub.roots["data"])[0])
+    payload = {"url": url, "port": port, "pid": pid, "host": "127.0.0.1",
+               "started_at": time.time(), "token": token,
+               "auth": {"header": "X-WorkflowHub-Token", "token": token},
+               "note": "只在本机可达：服务只绑 127.0.0.1，Host/Origin 还必须是回环字面量。",
+               **(extra or {})}
+    endpoint = hub.roots["data"] / "desktop.json"
+    endpoint.parent.mkdir(parents=True, exist_ok=True)
+    endpoint.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    _restrict_local_file(endpoint)
+    published = [endpoint, write_endpoint(hub.roots["data"], port=port, url=url, pid=pid,
+                                          token=token, extra=extra)]
+    agent_dir = hub.roots["project"] / "agent"
+    if agent_dir.is_dir():
+        # 统一标准的发现文件（AGENT_API_STANDARD.md：端口只是默认值，调用方一律读
+        # agent/.endpoint）。打包出去的目录里没有 agent/ 就跳过，不为此造目录。
+        try:
+            marker = agent_dir / ".endpoint"
+            marker.write_text(json.dumps({k: payload[k] for k in ("url", "port", "pid", "token", "auth")},
+                                         ensure_ascii=False, indent=1), encoding="utf-8")
+            _restrict_local_file(marker)
+            published.append(marker)
+        except OSError:
+            pass
+    hub.endpoint_files = published
+    return payload
+
+
+def retire_endpoint(hub: Any) -> None:
+    """服务停了就要把发现文件一起收掉：留着它，调用方会一直往一个死端口上打。
+
+    只删**本次发布写下的**那几个（`hub.endpoint_files`）加本 data 目录里那两个：
+    仓库里的 `agent/.endpoint` 可能是另一个实例写的，测试更是绝不该碰它。
+    """
+    targets = [Path(p) for p in getattr(hub, "endpoint_files", []) or []]
+    targets += [hub.roots["data"] / "desktop.json", hub.roots["data"] / "agent-endpoint.json"]
+    for path in targets:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+

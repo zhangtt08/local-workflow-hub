@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from workflowhub.api import create_app
 from workflowhub.bootstrap import build_hub
 
+from local_client import LOCAL_BASE_URL, local_client
 from test_discovery import fixtures
 
 TOOL = "script-tools-report-tool"
@@ -33,7 +34,7 @@ class LegacyAgentApiTests(unittest.TestCase):
         cls.hub = build_hub(cls.root / "data")
         cls.hub.catalog.scan([str(cls.machines)])
         cls.hub.registry.refresh()
-        cls.client = TestClient(create_app(cls.hub))
+        cls.client = local_client(cls.hub)
 
     @classmethod
     def tearDownClass(cls):
@@ -171,20 +172,42 @@ class LegacyTokenTests(unittest.TestCase):
     def setUp(self):
         os.environ["WORKFLOWHUB_TOKEN"] = "secret-token"
         self._tmp = tempfile.TemporaryDirectory()
+        self.machines = Path(self._tmp.name) / "machine"
+        self.machines.mkdir()
+        fixtures(self.machines)
         self.hub = build_hub(Path(self._tmp.name) / "data")
-        self.client = TestClient(create_app(self.hub))
+        self.hub.catalog.scan([str(self.machines)])
+        self.hub.registry.refresh()
+        self.client = local_client(self.hub)
 
     def tearDown(self):
         del os.environ["WORKFLOWHUB_TOKEN"]
         self._tmp.cleanup()
 
     def test_08_token_guard_covers_the_legacy_face(self):
-        self.assertEqual(
-            self.client.get("/api/agent/tools", headers={"x-workflowhub-token": "nope"}).status_code, 401)
-        self.assertEqual(self.client.get("/api/agent/tools").status_code, 401)
-        self.assertTrue(self.client.get("/api/agent/tools",
-                                        headers={"x-workflowhub-token": "secret-token"}).json()["ok"])
-        self.assertEqual(self.client.get("/api/health").status_code, 401)
+        """共享口令必须把旧契约面一起罩住，否则它就是一条旁路。
+
+        判据改了一条：按共享验收标准，口令要的是**非 GET**（`read` 风险的本机目录浏览
+        不必带口令，界面与 Agent 的发现流程因此不用配任何东西）。以前这里是"配了口令就
+        连 GET 一起拒"，比标准更严却和界面自己不相容 —— 那条不相容正是当时 `allow_origins=*`
+        被当成"必需"的原因。现在跨源与伪造 Host 由 `tests/test_local_guard.py` 那组守住。
+        """
+        tools = self.client.get("/api/agent/tools")
+        self.assertEqual(tools.status_code, 200, "只读的目录浏览不该先要口令（标准第 (d) 条只管非 GET）")
+        self.assertTrue(tools.json()["ok"])
+        refused = self.client.post("/api/agent/tool", json={"tool": TOOL,
+                                                            "input": {"dry_run": True, "input": "hi"}},
+                                   headers={"x-workflowhub-token": ""})
+        self.assertEqual(refused.status_code, 401, "旧契约面的 POST 不带货照样能跑，就是旁路")
+        self.assertEqual(refused.json()["error"]["code"], "permission_error")
+        held = self.client.post("/api/v1/tools/{key}/invoke".format(key=TOOL),
+                                json={"inputs": {"dry_run": True, "input": "hi"}},
+                                headers={"x-workflowhub-token": "wrong-token"})
+        self.assertEqual(held.status_code, 401)
+        granted = self.client.post("/api/agent/tool",
+                                   json={"tool": TOOL, "input": {"dry_run": True, "input": "hi"}},
+                                   headers={"x-workflowhub-token": "secret-token"})
+        self.assertTrue(granted.json()["ok"], f"带对口令就走同一条路：{granted.json()}")
 
 
 if __name__ == "__main__":

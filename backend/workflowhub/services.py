@@ -347,6 +347,8 @@ def snippets(base_url: str, catalog_key: str, skill_id: str, inputs: dict[str, A
 
 def overview(hub: Hub) -> dict[str, Any]:
     facets = hub.catalog.facets()
+    workflows = list_workflows_report(hub)
+    runs = list_runs_report(hub, limit=10)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "catalog": facets,
@@ -354,9 +356,11 @@ def overview(hub: Hub) -> dict[str, Any]:
         "scan_state": hub.catalog.scan_state,
         "settings": hub.catalog.settings,
         "skills": {"count": len(hub.directory.list()), "items": [s.id for s in hub.directory.list()][:20]},
-        "workflows": {"count": len(list_workflows(hub)), "items": list_workflows(hub)[:10]},
+        "workflows": {"count": len(workflows["items"]), "items": workflows["items"][:10],
+                      "skipped": workflows["skipped"]},
         "activity": hub.catalog.recent_activity(14),
-        "recent_runs": list_runs(hub, limit=10),
+        "recent_runs": runs["items"],
+        "unreadable_runs": runs["skipped"],
         "approvals": hub.catalog.pending_approvals(),
         "service": {"static_ui": bool(static_root()), "python": f"{Path(__file__).parts[0] and ''}"
                     f"{__import__('sys').version.split()[0]}", "version": hub.version()},
@@ -364,44 +368,66 @@ def overview(hub: Hub) -> dict[str, Any]:
 
 
 def list_workflows(hub: Hub) -> list[dict[str, Any]]:
+    return list_workflows_report(hub)["items"]
+
+
+def list_workflows_report(hub: Hub) -> dict[str, Any]:
+    """Workflow 清单 + **哪些文件没读进来**。
+
+    以前坏掉的那份 JSON 是被 `except Exception: continue` 悄悄跳过的：界面上就是少一条，
+    没人知道为什么，也没人知道它还在不在。现在照旧不因为它报错（一个坏文件不该让整个
+    清单打不开），但要把路径与原因列出来给人看 —— 第 4 号 NICE 的"诚实报告坏文件"。
+    """
     root = hub.roots["data"] / "workflows"
     out: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
     if not root.is_dir():
-        return out
+        return {"items": out, "skipped": skipped}
     for folder in sorted(root.iterdir()):
         for version_file in sorted(folder.glob("*.json")):
             try:
                 workflow = WorkflowDefinition.model_validate_json(version_file.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as exc:
+                skipped.append({"path": str(version_file), "reason": f"{type(exc).__name__}: {exc}"[:300]})
                 continue
             out.append({"id": workflow.id, "name": workflow.name, "version": workflow.version,
                         "nodes": len(workflow.nodes), "edges": len(workflow.edges),
                         "inputs": sorted(workflow.inputs), "file": str(version_file)})
-    return sorted(out, key=lambda item: item["id"])
+    return {"items": sorted(out, key=lambda item: item["id"]), "skipped": skipped}
 
 
 def list_runs(hub: Hub, limit: int = 25, status: str | None = None) -> list[dict[str, Any]]:
+    return list_runs_report(hub, limit, status)["items"]
+
+
+def list_runs_report(hub: Hub, limit: int = 25, status: str | None = None) -> dict[str, Any]:
+    """运行记录清单 + 被跳过的坏文件（同 `list_workflows_report`，一条判据）。"""
     root = hub.roots["data"] / "runs"
     if not root.is_dir():
-        return []
+        return {"items": [], "skipped": []}
     rows: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
     files = sorted(root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     for path in files[: max(limit, 1) * 4]:
-        summary = _run_summary(path)
-        if summary:
-            rows.append(summary)
+        summary, problem = _run_summary(path)
+        if summary is None:
+            skipped.append({"path": str(path), "reason": problem or "读不出摘要"})
+            continue
+        rows.append(summary)
     if status:
         rows = [r for r in rows if r["status"] == status]
-    return rows[:limit]
+    return {"items": rows[:limit], "skipped": skipped}
 
 
-def _run_summary(path: Path) -> dict[str, Any] | None:
+def _run_summary(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     try:
         data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"[:300]
+    if not isinstance(data, dict):
+        return None, f"顶层不是对象（{type(data).__name__}）"
     nodes = data.get("node_runs", {}) or {}
-    return {
+    summary = {
         "id": data.get("id"), "trace_id": data.get("trace_id"),
         "workflow_id": data.get("workflow_id"), "workflow_version_id": data.get("workflow_version_id"),
         "status": data.get("status"), "started_at": data.get("started_at"), "finished_at": data.get("finished_at"),
@@ -413,6 +439,7 @@ def _run_summary(path: Path) -> dict[str, Any] | None:
         "inputs": data.get("inputs"), "outputs": data.get("outputs"),
         "error": (data.get("error") or {}).get("message"),
     }
+    return summary, None
 
 
 def catalogue_stats(hub: Hub) -> dict[str, Any]:
