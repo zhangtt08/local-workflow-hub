@@ -1,0 +1,16 @@
+{
+  "id": "text-to-file",
+  "name": "Input → Text Transform → File Writer",
+  "version": 1,
+  "inputs": {"text": {"type": "string", "required": true}},
+  "outputs": {"file_path": {"type": "node_output", "node_id": "write", "field": "file_path"}},
+  "nodes": [
+    {"id": "input", "skill_id": "echo", "skill_version": "1.0.0", "inputs": {"text": {"type": "workflow_input", "name": "text"}}},
+    {"id": "transform", "skill_id": "text-transform", "skill_version": "1.0.0", "inputs": {"text": {"type": "node_output", "node_id": "input", "field": "text"}}},
+    {"id": "write", "skill_id": "file-writer", "skill_version": "1.0.0", "inputs": {"text": {"type": "node_output", "node_id": "transform", "field": "text"}, "filename": {"type": "literal", "value": "result.txt"}}}
+  ],
+  "edges": [
+    {"source": "input", "target": "transform"},
+    {"source": "transform", "target": "write"}
+  ]
+}

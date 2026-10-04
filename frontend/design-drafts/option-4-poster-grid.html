@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>方案四 · Poster Grid — WorkflowHub</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --ink:#0B0B0C; --paper:#FFFFFF; --gray:#F1F1F0; --gray-2:#E4E4E2;
+    --orange:#FF4400; --orange-soft:#FFEDE5;
+    --green:#0C7A43; --red:#C9372C; --amber:#8A6100;
+    --disp:'Archivo Black','PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+    --body:'PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+    --mono:'IBM Plex Mono',ui-monospace,Consolas,monospace;
+    --key:3px solid var(--ink);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--paper);color:var(--ink);font-family:var(--body);font-size:14px;line-height:1.65;-webkit-font-smoothing:antialiased}
+  button{font:inherit;cursor:pointer}
+  :focus-visible{outline:3px solid var(--orange);outline-offset:2px}
+  .wrap{max-width:1200px;margin:0 auto;border-left:var(--key);border-right:var(--key);min-height:100vh}
+
+  /* ── 顶栏 ─────────────────────────────── */
+  .top{border-bottom:var(--key);display:flex;align-items:stretch}
+  .logo{display:flex;align-items:center;gap:12px;padding:16px 24px;border-right:var(--key)}
+  .logo .sq{width:26px;height:26px;background:var(--orange);flex:none}
+  .logo b{font-family:var(--disp);font-size:17px;letter-spacing:.02em}
+  nav{display:flex;margin-left:auto}
+  nav a{display:flex;align-items:center;padding:0 22px;border-left:var(--key);font-weight:700;font-size:13.5px;letter-spacing:.06em}
+  nav a:hover{background:var(--gray)}
+  nav a.on{background:var(--ink);color:#fff}
+  nav a .n{font-family:var(--mono);font-size:10px;font-weight:500;color:var(--orange);margin-right:7px}
+  nav a.on .n{color:var(--orange)}
+
+  /* ── Hero ─────────────────────────────── */
+  .hero{display:grid;grid-template-columns:1fr 340px;border-bottom:var(--key)}
+  .hero-main{padding:44px 24px 36px;border-right:var(--key)}
+  .eyebrow{font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.28em;color:var(--orange)}
+  .hero h1{font-family:var(--disp);font-size:clamp(38px,5.2vw,64px);line-height:1.12;letter-spacing:.01em;margin:14px 0 18px}
+  .hero h1 .arr{color:var(--orange)}
+  .hero p{font-size:15px;max-width:52ch;color:#3D3D40}
+  .stats{display:grid;grid-template-rows:repeat(4,1fr)}
+  .stat{display:flex;align-items:baseline;gap:14px;padding:14px 24px;border-bottom:var(--key)}
+  .stat:last-child{border-bottom:none}
+  .stat b{font-family:var(--disp);font-size:34px;line-height:1;min-width:96px}
+  .stat span{font-family:var(--mono);font-size:10.5px;letter-spacing:.18em;color:#6B6B6E}
+  .stat.hot b{color:var(--orange)}
+
+  /* ── 流程带（DAG）────────────────────── */
+  .flowsec{border-bottom:var(--key);padding:0}
+  .sec-head{display:flex;align-items:center;gap:14px;padding:12px 24px;border-bottom:var(--key);background:var(--gray)}
+  .sec-head .k{font-family:var(--mono);font-size:10.5px;font-weight:600;letter-spacing:.22em}
+  .sec-head .t{font-weight:800;font-size:14px;letter-spacing:.14em}
+  .sec-head .r{margin-left:auto;font-family:var(--mono);font-size:11px;color:#6B6B6E}
+  .steps{display:grid;grid-template-columns:1fr 56px 1fr 56px 1fr;align-items:stretch}
+  .step{padding:26px 24px 22px;position:relative}
+  .step .num{font-family:var(--disp);font-size:64px;line-height:1;color:var(--gray-2);-webkit-text-stroke:2px var(--ink);position:relative;z-index:1}
+  .step.cur .num{color:var(--orange);-webkit-text-stroke:0}
+  .step h3{font-size:19px;font-weight:800;margin:12px 0 4px;letter-spacing:.03em}
+  .step .sid{font-family:var(--mono);font-size:11.5px;font-weight:600}
+  .step p{font-size:12.5px;color:#55555A;margin-top:8px;max-width:30ch}
+  .step .ms{position:absolute;top:24px;right:20px;font-family:var(--mono);font-size:11px;font-weight:600;border:2px solid var(--ink);padding:2px 8px}
+  .step.cur .ms{background:var(--ink);color:#fff}
+  .step.mid{border-left:var(--key);border-right:var(--key)}
+  .arrowcell{display:grid;place-items:center;border-right:var(--key)}
+  .arrowcell:last-of-type{border-right:none}
+  .arrowcell svg{display:block}
+  .statusbar{border-top:var(--key);background:var(--ink);color:#fff;display:flex;flex-wrap:wrap;gap:6px 28px;padding:11px 24px;font-family:var(--mono);font-size:11.5px;letter-spacing:.06em}
+  .statusbar .s{color:var(--orange);font-weight:600}
+
+  /* ── 运行区 ───────────────────────────── */
+  .runsec{display:grid;grid-template-columns:1.5fr 1fr;border-bottom:var(--key)}
+  .run-l{padding:24px;border-right:var(--key)}
+  .field label{display:block;font-family:var(--mono);font-size:10.5px;font-weight:600;letter-spacing:.22em;margin-bottom:8px}
+  .field .row{display:flex;gap:0}
+  .field input{flex:1;font:600 15px var(--mono);border:var(--key);border-right:none;padding:13px 16px;background:var(--paper);color:var(--ink);min-width:0}
+  .field input:focus{outline:none;background:var(--orange-soft)}
+  .runbtn{background:var(--orange);color:#fff;border:var(--key);font-weight:800;font-size:14px;letter-spacing:.1em;padding:13px 26px;display:inline-flex;gap:10px;align-items:center}
+  .runbtn:hover{background:var(--ink)}
+  .hint{font-family:var(--mono);font-size:10.5px;color:#6B6B6E;margin-top:10px}
+  .run-r{padding:24px;display:flex;flex-direction:column;gap:0}
+  .bigword{font-family:var(--disp);font-size:44px;line-height:1;color:var(--green);display:flex;align-items:center;gap:12px}
+  .kv{display:flex;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:2px solid var(--gray-2);font-family:var(--mono);font-size:12px}
+  .kv b{font-weight:600}
+  .kv span{color:#6B6B6E}
+  .kv .path{color:var(--orange);font-weight:600;text-align:right;word-break:break-all}
+
+  /* ── 注册表 ───────────────────────────── */
+  .skills{border-bottom:var(--key)}
+  .skrow{display:grid;grid-template-columns:150px 1fr auto auto;align-items:center;gap:18px;padding:18px 24px;border-bottom:2px solid var(--gray-2)}
+  .skrow:last-child{border-bottom:none}
+  .skrow:hover{background:var(--gray)}
+  .skrow .ver{font-family:var(--disp);font-size:30px;color:var(--gray-2);-webkit-text-stroke:1.5px var(--ink);line-height:1}
+  .skrow .sid{font-family:var(--mono);font-weight:600;font-size:15px}
+  .skrow .sid small{display:block;font-family:var(--body);font-weight:400;font-size:12px;color:#55555A;margin-top:2px}
+  .skrow .tag{font-family:var(--mono);font-size:10.5px;font-weight:600;border:2px solid var(--ink);padding:2px 9px;letter-spacing:.06em}
+  .skrow .tag.req{border-color:var(--orange);color:var(--orange)}
+
+  /* ── 运行历史 ─────────────────────────── */
+  .hist{border-bottom:var(--key)}
+  .hrow{display:grid;grid-template-columns:130px 1fr 150px 90px 110px;gap:14px;align-items:center;padding:13px 24px;border-bottom:2px solid var(--gray-2);font-family:var(--mono);font-size:12px}
+  .hrow:last-child{border-bottom:none}
+  .hrow:hover{background:var(--gray)}
+  .hrow .st{font-weight:800;font-size:13px;letter-spacing:.05em;display:flex;align-items:center;gap:8px}
+  .hrow .st::before{content:'';width:10px;height:10px;flex:none}
+  .hrow .st.ok{color:var(--green)} .hrow .st.ok::before{background:var(--green)}
+  .hrow .st.bad{color:var(--red)} .hrow .st.bad::before{background:var(--red)}
+  .hrow .st.wait{color:var(--amber)} .hrow .st.wait::before{border:2.5px solid var(--amber);width:6px;height:6px}
+  .hrow .why{color:#6B6B6E}
+  .hrow .t{color:#6B6B6E;text-align:right}
+
+  footer{padding:14px 24px;display:flex;gap:24px;font-family:var(--mono);font-size:10.5px;color:#6B6B6E;letter-spacing:.06em}
+  footer b{color:var(--ink);font-weight:600}
+
+  @media (max-width:960px){
+    .wrap{border-left:none;border-right:none}
+    .top{flex-wrap:wrap}.logo{border-right:none;flex:1}nav{width:100%;border-top:var(--key)}nav a{flex:1;justify-content:center;padding:10px 0;border-left:var(--key)}
+    .hero{grid-template-columns:1fr}.hero-main{border-right:none;border-bottom:var(--key)}
+    .steps{grid-template-columns:1fr}.arrowcell,.step.mid{border:none;border-bottom:var(--key);padding:10px}
+    .step.mid{padding:26px 24px}
+    .runsec{grid-template-columns:1fr}.run-l{border-right:none;border-bottom:var(--key)}
+    .skrow{grid-template-columns:1fr auto;grid-template-rows:auto auto}.skrow .ver{display:none}
+    .hrow{grid-template-columns:110px 1fr 80px;}.hrow .why,.hrow .t{display:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- 顶栏 -->
+  <header class="top">
+    <div class="logo"><span class="sq" aria-hidden="true"></span><b>WORKFLOWHUB</b></div>
+    <nav>
+      <a class="on" href="#"><span class="n">01</span>概览</a>
+      <a href="#"><span class="n">02</span>工作流</a>
+      <a href="#"><span class="n">03</span>注册表</a>
+      <a href="#"><span class="n">04</span>运行</a>
+    </nav>
+  </header>
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="hero-main">
+      <div class="eyebrow">SKILL REGISTRY × DAG ORCHESTRATION</div>
+      <h1>把技能排成工序，<br/>一次规划，反复<span class="arr">运行</span>。</h1>
+      <p>注册本地 Skill，用有向无环图声明工序。版本发布后不可覆盖；每次运行持有契约快照与完整 Trace。</p>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>3</b><span>SKILLS REGISTERED</span></div>
+      <div class="stat"><b>1</b><span>WORKFLOW PUBLISHED</span></div>
+      <div class="stat"><b>12</b><span>RUNS TOTAL</span></div>
+      <div class="stat hot"><b>412<span style="font-size:18px">MS</span></b><span>LAST RUN · SUCCEEDED</span></div>
+    </div>
+  </section>
+
+  <!-- 流程带 -->
+  <section class="flowsec">
+    <div class="sec-head"><span class="k">FIG.01</span><span class="t">工 序 流 向</span><span class="r">text-to-file@1 · 只读</span></div>
+    <div class="steps">
+      <article class="step">
+        <span class="ms">38MS</span>
+        <div class="num">01</div>
+        <h3>回显输入</h3>
+        <div class="sid">echo@1.0.0</div>
+        <p>原样返回输入文本，用于链路诊断</p>
+      </article>
+      <div class="arrowcell" aria-hidden="true">
+        <svg width="30" height="22" viewBox="0 0 30 22"><path d="M0 11h22" stroke="#0B0B0C" stroke-width="3.5"/><path d="M20 2l10 9-10 9z" fill="#FF4400"/></svg>
+      </div>
+      <article class="step mid">
+        <span class="ms">21MS</span>
+        <div class="num">02</div>
+        <h3>文本转换</h3>
+        <div class="sid">text-transform@1.0.0</div>
+        <p>按绑定参数执行大写 / trim 变换</p>
+      </article>
+      <div class="arrowcell" aria-hidden="true">
+        <svg width="30" height="22" viewBox="0 0 30 22"><path d="M0 11h22" stroke="#0B0B0C" stroke-width="3.5"/><path d="M20 2l10 9-10 9z" fill="#FF4400"/></svg>
+      </div>
+      <article class="step">
+        <span class="ms">353MS</span>
+        <div class="num">03</div>
+        <h3>写入文件</h3>
+        <div class="sid">file-writer@1.0.0</div>
+        <p>将结果写入受校验的 Artifact 路径</p>
+      </article>
+    </div>
+    <div class="statusbar">
+      <span>RUN <span class="s">run_9f2ka</span></span>
+      <span>STATUS <span class="s">SUCCEEDED</span></span>
+      <span>TOTAL 412MS</span>
+      <span>TRACE 7F42C1E0</span>
+      <span style="margin-left:auto">ARTIFACT ×1</span>
+    </div>
+  </section>
+
+  <!-- 运行 -->
+  <section class="runsec">
+    <div class="run-l">
+      <div class="field">
+        <label for="inp">INPUT · TEXT</label>
+        <div class="row">
+          <input id="inp" value="hello workflowhub" spellcheck="false" />
+          <button class="runbtn" type="button">运行 ▸</button>
+        </div>
+        <p class="hint">POST /api/workflows/text-to-file/run · {"version":1,"inputs":{"text":"…"}}</p>
+      </div>
+    </div>
+    <div class="run-r">
+      <div class="bigword">成功 ✓</div>
+      <div style="margin-top:14px">
+        <div class="kv"><span>run</span><b>run_9f2ka</b></div>
+        <div class="kv"><span>trace</span><b>7f42c1e0</b></div>
+        <div class="kv"><span>outputs</span><b class="path">data/artifacts/run_9f2ka/result.txt</b></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 注册表 -->
+  <section class="skills">
+    <div class="sec-head"><span class="k">FIG.02</span><span class="t">SKILL 注 册 表</span><span class="r">YAML 自动发现 · 3 项</span></div>
+    <div class="skrow">
+      <span class="ver">1.0.0</span>
+      <span class="sid">echo<small>返回输入原文，用于连通性诊断</small></span>
+      <span></span>
+      <span class="tag">无权限</span>
+    </div>
+    <div class="skrow">
+      <span class="ver">1.0.0</span>
+      <span class="sid">text-transform<small>大小写 / trim 文本变换</small></span>
+      <span></span>
+      <span class="tag">无权限</span>
+    </div>
+    <div class="skrow">
+      <span class="ver">1.0.0</span>
+      <span class="sid">file-writer<small>将文本写入受检 Artifact 路径</small></span>
+      <span></span>
+      <span class="tag req">FILE:WRITE</span>
+    </div>
+  </section>
+
+  <!-- 运行历史 -->
+  <section class="hist">
+    <div class="sec-head"><span class="k">FIG.03</span><span class="t">运 行 记 录</span><span class="r">JSONL TRACE · 不可变</span></div>
+    <div class="hrow"><span>run_9f2ka</span><span class="st ok">成功</span><span>412ms</span><span class="why">artifact 已落盘</span><span class="t">03:41</span></div>
+    <div class="hrow"><span>run_7wx1e</span><span class="st ok">成功</span><span>398ms</span><span class="why">—</span><span class="t">03:39</span></div>
+    <div class="hrow"><span>run_5dq8m</span><span class="st bad">失败</span><span>102ms</span><span class="why">E503 路径越界</span><span class="t">03:36</span></div>
+    <div class="hrow"><span>run_3csnt</span><span class="st wait">等待</span><span>—</span><span class="why">file-writer 请求复核</span><span class="t">03:31</span></div>
+    <div class="hrow"><span>run_1ab0z</span><span class="st ok">成功</span><span>405ms</span><span class="why">—</span><span class="t">03:28</span></div>
+  </section>
+
+  <footer>
+    <span><b>WORKFLOWHUB</b> CORE PREVIEW</span>
+    <span>SCHEDULER / SEQUENTIAL</span>
+    <span>REGISTRY / 3 SKILLS</span>
+    <span style="margin-left:auto">2026-10-03</span>
+  </footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,13 @@
+id: text-transform
+name: Text Transform
+version: 1.0.0
+description: Uppercase a string for the demonstration Workflow.
+category: demo
+tags: [text, transform]
+inputs:
+  text: {type: string, required: true}
+outputs:
+  text: {type: string, required: true}
+executor: {type: python, entry: handler.py}
+permissions: []
+timeout_seconds: 5

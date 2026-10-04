@@ -1,0 +1,13 @@
+id: echo
+name: Echo
+version: 1.0.0
+description: Pass text through unchanged.
+category: demo
+tags: [text, input]
+inputs:
+  text: {type: string, required: true}
+outputs:
+  text: {type: string, required: true}
+executor: {type: python, entry: handler.py}
+permissions: []
+timeout_seconds: 5

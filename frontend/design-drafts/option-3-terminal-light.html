@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>方案三 · Terminal Light — WorkflowHub</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --bg:#E9EFEA; --panel:#F5F9F4; --panel-2:#EDF3EC;
+    --ink:#182F20; --soft:#52705C; --faint:#8AA394;
+    --line:#CBDCCF; --line-soft:#DCE8DE;
+    --green:#17663B; --green-bg:#E2EFE5;
+    --amber:#8A6100; --amber-bg:#F4EBD2;
+    --red:#AE3A34; --red-bg:#F3E1DE;
+    --link:#0F5FA8;
+    --mono:'IBM Plex Mono',ui-monospace,'Cascadia Code',Consolas,monospace;
+    --cjk:'PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:13px;line-height:1.7;-webkit-font-smoothing:antialiased;padding:22px 16px 70px}
+  button{font:inherit;cursor:pointer}
+  :focus-visible{outline:2px solid var(--green);outline-offset:2px}
+  .cjk{font-family:var(--cjk)}
+
+  .term{max-width:1120px;margin:0 auto;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden;box-shadow:0 14px 40px rgba(24,47,32,.10)}
+  /* 窗口栏 */
+  .bar{display:flex;align-items:center;gap:8px;background:var(--panel-2);border-bottom:1px solid var(--line);padding:9px 14px}
+  .bar .dot{width:10px;height:10px;border-radius:99px;border:1px solid var(--line);background:#fff}
+  .bar .dot.g{background:#9CC5A8;border-color:#8AB698}
+  .bar .addr{margin-left:10px;font-size:11.5px;color:var(--soft);letter-spacing:.03em}
+  .bar .addr b{color:var(--ink);font-weight:500}
+  .bar .tab{margin-left:auto;font-size:10.5px;color:var(--soft);border:1px solid var(--line);border-radius:5px 5px 0 0;background:var(--panel);padding:2px 10px;position:relative;top:5px}
+
+  .layout{display:grid;grid-template-columns:250px 1fr}
+
+  /* ── 左：目录树 ───────────────────────── */
+  .tree{border-right:1px solid var(--line);padding:16px 14px;font-size:12px;color:var(--soft);background:var(--panel-2)}
+  .tree .cap{font-size:10px;letter-spacing:.22em;color:var(--faint);margin:4px 0 10px 4px}
+  .tree pre{font:inherit;line-height:1.95;white-space:pre;overflow-x:auto}
+  .tree .dir{color:var(--ink);font-weight:600}
+  .tree .sel{background:var(--green-bg);color:var(--green);font-weight:600;display:inline-block;border-radius:4px;padding:0 5px;margin:0 -5px}
+  .tree .ok{color:var(--green)}
+  .tree .num{color:var(--faint)}
+
+  /* ── 右：主输出 ───────────────────────── */
+  .out{padding:18px 22px 26px;display:flex;flex-direction:column;gap:22px;min-width:0}
+  .cmd{display:flex;gap:10px;align-items:baseline}
+  .cmd .pr{color:var(--green);font-weight:600;flex:none}
+  .cmd .txt{color:var(--ink);font-weight:500}
+  .cmd .txt .fl{color:var(--link);text-decoration:underline;text-underline-offset:3px}
+  .muted{color:var(--faint)}
+
+  /* ASCII DAG */
+  .diagram{border:1px solid var(--line);border-radius:8px;background:var(--panel-2);padding:18px 20px 14px;overflow-x:auto}
+  .drow{display:flex;align-items:center;width:max-content;min-width:100%}
+  .dnode{border:1px solid var(--ink);background:var(--panel);padding:7px 12px 6px;min-width:158px}
+  .dnode .id{font-size:12px;font-weight:600;letter-spacing:.02em}
+  .dnode .stt{font-size:10.5px;color:var(--soft);display:flex;justify-content:space-between;gap:12px;margin-top:3px}
+  .dnode .stt .s-ok{color:var(--green);font-weight:600}
+  .dnode .stt .ms{color:var(--faint)}
+  .dlink{flex:none;padding:0 6px;color:var(--soft);font-size:12px;letter-spacing:-.5px;white-space:pre}
+  .dcaps{display:flex;width:max-content;min-width:100%}
+  .dcaps span{min-width:158px;flex:none;padding:6px 12px 0;font-size:10.5px;color:var(--faint)}
+  .dcaps span:nth-child(3n+1){margin-right:0}
+  .dlinkcap{flex:none;width:34px}
+
+  /* 日志流 */
+  .log{border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:14px 18px;overflow-x:auto}
+  .log .ln{white-space:pre;display:flex;gap:0}
+  .log .ts{color:var(--faint);flex:none;width:118px}
+  .log .lv{flex:none;width:64px;font-weight:600}
+  .log .lv.ok{color:var(--green)} .log .lv.info{color:var(--link)} .log .lv.err{color:var(--red)}
+  .log .dots{color:var(--line);letter-spacing:1px}
+  .log .ok{color:var(--green);font-weight:600}
+  .log .am{color:var(--amber)}
+  .log .path{color:var(--link);text-decoration:underline;text-underline-offset:3px}
+  .cursor{display:inline-block;width:8px;height:15px;background:var(--green);vertical-align:-2px;animation:blink 1.05s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+
+  /* 输入行 */
+  .runline{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2);padding:10px 14px}
+  .runline .pr{color:var(--green);font-weight:600;flex:none}
+  .runline input{flex:1;background:none;border:none;outline:none;font:inherit;color:var(--ink)}
+  .runline input::placeholder{color:var(--faint)}
+  .runline button{flex:none;background:var(--green);color:#F3FAF4;border:none;border-radius:6px;padding:5px 16px;font-weight:600;font-size:12px}
+  .runline button:hover{background:#125A34}
+
+  /* 双栏：注册表 + 历史 */
+  .grid2{display:grid;grid-template-columns:1.5fr 1fr;gap:16px}
+  .sec-cap{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}
+  .sec-cap .pr{color:var(--green);font-weight:600}
+  .sec-cap h2{font-size:12px;font-weight:600;letter-spacing:.14em;color:var(--soft)}
+  .sec-cap .n{margin-left:auto;font-size:10.5px;color:var(--faint)}
+  .panelbox{border:1px solid var(--line);border-radius:8px;background:var(--panel);overflow:hidden}
+  .ls{width:100%;border-collapse:collapse;font-size:12px}
+  .ls th{text-align:left;font-size:10px;letter-spacing:.14em;color:var(--faint);font-weight:500;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel-2)}
+  .ls td{padding:8px 12px;border-bottom:1px solid var(--line-soft);color:var(--ink);white-space:nowrap}
+  .ls tr:last-child td{border-bottom:none}
+  .ls tbody tr:hover td{background:var(--panel-2)}
+  .ls .desc{white-space:normal;color:var(--soft)}
+  .pill{font-size:10px;border-radius:4px;padding:1px 7px;font-weight:600}
+  .pill.free{background:var(--green-bg);color:var(--green)}
+  .pill.req{background:var(--amber-bg);color:var(--amber)}
+  .hist{padding:10px 14px;display:flex;flex-direction:column}
+  .hist .ln{white-space:pre;overflow-x:auto;text-overflow:clip}
+  .hist .g{color:var(--green);font-weight:600}
+  .hist .r{color:var(--red);font-weight:600}
+  .hist .a{color:var(--amber);font-weight:600}
+  .hist .id{color:var(--link)}
+
+  .foot{max-width:1120px;margin:14px auto 0;font-size:11px;color:var(--faint);display:flex;gap:18px}
+  .foot b{color:var(--soft);font-weight:500}
+
+  @media (prefers-reduced-motion:reduce){.cursor{animation:none}}
+  @media (max-width:940px){
+    .layout{grid-template-columns:1fr}
+    .tree{border-right:none;border-bottom:1px solid var(--line);min-width:0}
+    .grid2{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+<div class="term">
+  <div class="bar">
+    <span class="dot g"></span><span class="dot"></span><span class="dot"></span>
+    <span class="addr">workflowhub://<b>workflows/text-to-file@1</b></span>
+    <span class="tab">run — bash</span>
+  </div>
+
+  <div class="layout">
+    <!-- 目录树 -->
+    <nav class="tree" aria-label="资源目录">
+      <div class="cap">REGISTRY</div>
+      <pre><span class="dir">workflowhub/</span>
+├─ skills/
+│  ├─ echo<span class="ok">@1.0.0</span>
+│  ├─ text-transform<span class="ok">@1.0.0</span>
+│  └─ file-writer<span class="ok">@1.0.0</span>
+├─ workflows/
+│  └─ <span class="sel">text-to-file@1</span>
+├─ runs/
+│  └─ <span class="num">12 个运行记录</span>
+└─ events.jsonl</pre>
+      <div class="cap" style="margin-top:18px">EXECUTOR</div>
+      <pre><span class="dir">python-subprocess</span>
+   timeout   30s
+   retry     2 次集中重试
+   sandbox   <span class="num">非安全沙箱</span></pre>
+    </nav>
+
+    <!-- 主输出 -->
+    <main class="out">
+      <div class="cmd"><span class="pr">$</span><span class="txt">workflowhub describe <span class="fl">text-to-file@1</span></span></div>
+
+      <!-- ASCII DAG -->
+      <div class="diagram" role="img" aria-label="DAG 图：echo 连到 text-transform 再连到 file-writer，全部执行成功">
+        <div class="drow">
+          <div class="dnode">
+            <div class="id">echo@1.0.0</div>
+            <div class="stt"><span class="s-ok">[ ok ]</span><span class="ms">38ms</span></div>
+          </div>
+          <span class="dlink">──────▶</span>
+          <div class="dnode">
+            <div class="id">text-transform@1.0.0</div>
+            <div class="stt"><span class="s-ok">[ ok ]</span><span class="ms">21ms</span></div>
+          </div>
+          <span class="dlink">──────▶</span>
+          <div class="dnode">
+            <div class="id">file-writer@1.0.0</div>
+            <div class="stt"><span class="s-ok">[ ok ]</span><span class="ms">353ms</span></div>
+          </div>
+        </div>
+        <div class="dcaps">
+          <span>SK-01 · <span class="cjk">回显输入</span></span>
+          <span class="dlinkcap"></span>
+          <span>SK-02 · <span class="cjk">大写转换</span></span>
+          <span class="dlinkcap"></span>
+          <span>SK-03 · <span class="cjk">写入</span> artifact</span>
+        </div>
+      </div>
+
+      <!-- 运行输入 -->
+      <div class="cmd"><span class="pr">$</span><span class="txt muted">workflowhub run text-to-file@1 --input text=…</span></div>
+      <div class="runline">
+        <span class="pr">$</span>
+        <input value="hello workflowhub" aria-label="输入文本" spellcheck="false" />
+        <button type="button">运行 ⏎</button>
+      </div>
+
+      <!-- 日志流 -->
+      <div class="log">
+        <div class="ln"><span class="ts">00:00:00.012</span><span class="lv info">[INFO]</span><span>3 nodes scheduled · trace <span class="path">7f42c1e0</span></span></div>
+        <div class="ln"><span class="ts">00:00:00.014</span><span class="lv ok">[ OK ]</span><span>node echo <span class="dots">...................</span> <span class="ok">ok</span> <span class="am">38ms</span></span></div>
+        <div class="ln"><span class="ts">00:00:00.051</span><span class="lv ok">[ OK ]</span><span>node text-transform <span class="dots">...........</span> <span class="ok">ok</span> <span class="am">21ms</span></span></div>
+        <div class="ln"><span class="ts">00:00:00.072</span><span class="lv ok">[ OK ]</span><span>node file-writer <span class="dots">.............</span> <span class="ok">ok</span> <span class="am">353ms</span> · 1 artifact</span></div>
+        <div class="ln"><span class="ts">00:00:00.424</span><span class="lv ok">[ OK ]</span><span>run <span class="path">run_9f2ka</span> finished: <span class="ok">succeeded</span> in 412ms</span></div>
+        <div class="ln"><span class="ts"></span><span class="lv"></span><span>→ <span class="path">data/artifacts/run_9f2ka/result.txt</span> <span class="cursor" aria-hidden="true"></span></span></div>
+      </div>
+
+      <!-- 双栏 -->
+      <div class="grid2">
+        <section>
+          <div class="sec-cap"><span class="pr">$</span><h2>LS SKILLS/</h2><span class="n">3 items · auto-discovered</span></div>
+          <div class="panelbox">
+            <table class="ls">
+              <thead><tr><th>ID</th><th>VER</th><th class="cjk">说明</th><th class="cjk">权限</th></tr></thead>
+              <tbody>
+                <tr><td>echo</td><td>1.0.0</td><td class="desc cjk">返回输入原文，用于链路诊断</td><td><span class="pill free">none</span></td></tr>
+                <tr><td>text-transform</td><td>1.0.0</td><td class="desc cjk">大小写 / trim 文本变换</td><td><span class="pill free">none</span></td></tr>
+                <tr><td>file-writer</td><td>1.0.0</td><td class="desc cjk">写入受校验 Artifact 路径</td><td><span class="pill req">file:write</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+        <section>
+          <div class="sec-cap"><span class="pr">$</span><h2>TAIL RUNS/</h2><span class="n">12 runs</span></div>
+          <div class="panelbox hist">
+            <div class="ln"><span class="g">✓</span> run_9f2ka  412ms  <span class="id">7f42c1e0</span></div>
+            <div class="ln"><span class="g">✓</span> run_7wx1e  398ms  <span class="id">b2108d4f</span></div>
+            <div class="ln"><span class="r">✗</span> run_5dq8m  102ms  <span class="cjk" style="color:var(--red)">E503 路径越界</span></div>
+            <div class="ln"><span class="a">◔</span> run_3csnt   —    <span class="cjk" style="color:var(--amber)">等待人工复核</span></div>
+            <div class="ln"><span class="g">✓</span> run_1ab0z  405ms  <span class="id">e7c15d68</span></div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+</div>
+
+<p class="foot"><span><b>status</b> core-preview</span><span><b>scheduler</b> sequential</span><span><b>events</b> data/events.jsonl</span></p>
+</body>
+</html>

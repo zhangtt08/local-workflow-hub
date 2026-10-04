@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>方案二 · Blueprint 图纸风 — WorkflowHub</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --paper:#F2F6F3; --grid-minor:rgba(21,77,88,.07); --grid-major:rgba(21,77,88,.16);
+    --ink:#153B44; --ink-soft:#3D6470; --line:#9DB8B3; --line-soft:#C6D6D1;
+    --stamp:#B3382C; --pass:#2E7D4F; --hold:#A96A0E;
+    --mono:'IBM Plex Mono',ui-monospace,Consolas,monospace;
+    --sans:'IBM Plex Sans','PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#E4EAE7;color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased;padding:26px 18px 60px}
+  button{font:inherit;cursor:pointer}
+  :focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+
+  /* ── 图纸外框 ─────────────────────────── */
+  .sheet{max-width:1180px;margin:0 auto;background:
+      repeating-linear-gradient(0deg,var(--grid-minor) 0 1px,transparent 1px 9px),
+      repeating-linear-gradient(90deg,var(--grid-minor) 0 1px,transparent 1px 9px),
+      repeating-linear-gradient(0deg,var(--grid-major) 0 1px,transparent 1px 90px),
+      repeating-linear-gradient(90deg,var(--grid-major) 0 1px,transparent 1px 90px),
+      var(--paper);
+    border:2px solid var(--ink);position:relative;padding:34px 38px 30px;box-shadow:0 18px 50px rgba(21,59,68,.16)}
+  .sheet::before{content:'';position:absolute;inset:7px;border:1px solid var(--ink);pointer-events:none}
+  /* 角部对位标记 */
+  .mark{position:absolute;width:15px;height:15px;pointer-events:none}
+  .mark::before,.mark::after{content:'';position:absolute;background:var(--ink)}
+  .mark::before{left:7px;top:7px;width:1px;height:15px}
+  .mark::after{left:0;top:14px;width:15px;height:1px}
+  .mark.tl{left:14px;top:14px}.mark.tr{right:14px;top:14px;transform:scaleX(-1)}
+  .mark.bl{left:14px;bottom:14px;transform:scaleY(-1)}.mark.br{right:14px;bottom:14px;transform:scale(-1)}
+
+  /* ── 标题栏 ───────────────────────────── */
+  .head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;padding:0 6px 16px;border-bottom:1.5px solid var(--ink)}
+  .head .proj{font-family:var(--mono);font-size:11px;letter-spacing:.22em;color:var(--ink-soft)}
+  .head h1{font-size:26px;font-weight:700;letter-spacing:.02em;margin-top:4px}
+  .head h1 em{font-style:normal;font-family:var(--mono);font-size:15px;font-weight:500;border:1px solid var(--ink);border-radius:3px;padding:2px 8px;vertical-align:4px;margin-left:12px;letter-spacing:.08em}
+  .head .meta{font-family:var(--mono);font-size:11.5px;line-height:1.9;text-align:right;color:var(--ink-soft)}
+  .head .meta b{color:var(--ink);font-weight:600}
+
+  /* ── 主体网格 ─────────────────────────── */
+  .body{display:grid;grid-template-columns:1fr 330px;gap:0;border-bottom:1.5px solid var(--ink)}
+  .zone{padding:22px 26px 26px;min-width:0}
+  .zone-a{border-right:1px solid var(--ink)}
+  .zone-cap{display:flex;align-items:baseline;gap:14px;margin-bottom:18px}
+  .zone-cap .no{font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.14em;border:1px solid var(--ink);border-radius:3px;padding:1px 7px}
+  .zone-cap h2{font-size:15px;font-weight:700;letter-spacing:.2em}
+  .zone-cap .en{font-family:var(--mono);font-size:10px;letter-spacing:.18em;color:var(--ink-soft)}
+
+  /* ── 装配图（DAG）────────────────────── */
+  .assembly{padding:26px 6px 8px;overflow-x:auto;max-width:100%}
+  .dag{display:flex;align-items:center;min-width:640px;width:max-content;margin:0 auto}
+  .part{flex:none;width:196px;border:1.5px solid var(--ink);background:rgba(242,246,243,.92);position:relative;padding:12px 14px 11px}
+  .part::after{content:'';position:absolute;inset:3px;border:1px solid var(--line);pointer-events:none}
+  .part .code{position:absolute;top:-9px;left:10px;background:var(--paper);font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.16em;padding:0 6px;color:var(--ink-soft)}
+  .part h3{font-size:15px;font-weight:700;margin:2px 0 2px}
+  .part .sub{font-family:var(--mono);font-size:11px;color:var(--ink-soft)}
+  .part .st{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10.5px;font-weight:600;color:var(--pass);margin-top:9px;border-top:1px dashed var(--line);padding-top:8px;width:100%}
+  .part .st::before{content:'';width:7px;height:7px;border:1.5px solid var(--pass);transform:rotate(45deg)}
+  .wire{flex:none;width:96px;position:relative;display:grid;place-items:center;padding-top:26px}
+  .wire svg{display:block}
+  .wire .dim{position:absolute;top:0;left:50%;transform:translateX(-50%);font-family:var(--mono);font-size:10px;color:var(--ink-soft);letter-spacing:.05em}
+  .note{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft);text-align:center;margin-top:16px;letter-spacing:.08em}
+  .note b{color:var(--ink);font-weight:600}
+
+  /* ── 明细表（BOM）────────────────────── */
+  table{width:100%;border-collapse:collapse}
+  .tscroll{overflow-x:auto}
+  .bom th,.bom td{border:1px solid var(--line);padding:7px 9px;font-size:12px}
+  .bom th{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.1em;background:rgba(21,59,68,.05);color:var(--ink-soft)}
+  .bom td.mono{font-family:var(--mono);font-size:11.5px}
+  .bom td .req{color:var(--stamp);font-weight:600}
+
+  /* ── 检验记录 ─────────────────────────── */
+  .foot{display:grid;grid-template-columns:1fr 380px;gap:0}
+  .foot .zone{border-right:1px solid var(--ink)}
+  .foot .zone:last-child{border-right:none}
+  .rec{border:1px solid var(--line);position:relative}
+  .rec th,.rec td{border:1px solid var(--line-soft);padding:7px 10px;font-size:12px}
+  .rec th{font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--ink-soft);background:rgba(21,59,68,.05);font-weight:600}
+  .rec td.mono{font-family:var(--mono);font-size:11.5px;color:var(--ink-soft)}
+  .verdict{font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.1em}
+  .verdict.pass{color:var(--pass)} .verdict.fail{color:var(--stamp)} .verdict.hold{color:var(--hold)}
+  .rec tr.latest td{background:rgba(46,125,79,.06)}
+
+  /* 印章 */
+  .stamp{position:absolute;right:118px;top:-26px;transform:rotate(-9deg);border:2.5px solid var(--pass);border-radius:6px;color:var(--pass);padding:6px 16px 5px;font-family:var(--mono);font-size:13px;font-weight:600;letter-spacing:.3em;text-align:center;opacity:.85;mix-blend-mode:multiply;background:rgba(242,246,243,.6)}
+  .stamp small{display:block;font-size:9px;letter-spacing:.22em;font-weight:500;margin-top:1px}
+  .stamp.fail{border-color:var(--stamp);color:var(--stamp)}
+
+  /* ── 图签栏 ───────────────────────────── */
+  .tblock{border:1.5px solid var(--ink);display:grid;grid-template-columns:1fr 1fr 1fr;font-family:var(--mono)}
+  .tblock div{border:.5px solid var(--line);padding:6px 10px 5px}
+  .tblock div:nth-child(3n+1){border-left-width:1.5px}
+  .tblock div:nth-child(3n){border-right-width:1.5px}
+  .tblock div:nth-child(-n+3){border-top-width:1.5px}
+  .tblock div:nth-last-child(-n+3){border-bottom-width:1.5px}
+  .tblock .k{display:block;font-size:8.5px;letter-spacing:.2em;color:var(--ink-soft)}
+  .tblock .v{font-size:12px;font-weight:600;letter-spacing:.04em}
+
+  /* 交互 */
+  .part,.bom tr,.rec tbody tr{transition:background .15s ease}
+  .part:hover{background:#fff}
+  .bom tbody tr:hover,.rec tbody tr:hover{background:rgba(21,59,68,.05)}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+  @media (max-width:980px){
+    .body{grid-template-columns:1fr}
+    .zone-a{border-right:none;border-bottom:1px solid var(--ink)}
+    .foot{grid-template-columns:1fr}
+    .foot .zone{border-right:none;border-bottom:1px solid var(--ink)}
+    .stamp{right:24px;top:-18px}
+    .head{flex-direction:column;align-items:flex-start}
+    .head .meta{text-align:left}
+  }
+</style>
+</head>
+<body>
+<div class="sheet">
+  <span class="mark tl"></span><span class="mark tr"></span><span class="mark bl"></span><span class="mark br"></span>
+
+  <!-- 标题栏 -->
+  <header class="head">
+    <div>
+      <div class="proj">PROJECT · WORKFLOWHUB SKILL ORCHESTRATION</div>
+      <h1>TEXT-TO-FILE 工序装配图<em>DAG · REV.1</em></h1>
+    </div>
+    <div class="meta">
+      图号 <b>WFH-TTF-001</b><br/>
+      发布版本 <b>text-to-file@1 · 不可覆盖</b><br/>
+      制图日期 <b>2026-10-03</b>
+    </div>
+  </header>
+
+  <div class="body">
+    <!-- 装配区 -->
+    <section class="zone zone-a">
+      <div class="zone-cap"><span class="no">图 A</span><h2>工 序 流 向</h2><span class="en">ASSEMBLY / DATA FLOW</span></div>
+      <div class="assembly">
+        <div class="dag">
+          <article class="part">
+            <span class="code">SK-01</span>
+            <h3>回显输入</h3>
+            <div class="sub">echo @ 1.0.0</div>
+            <div class="st">检验通过 · 38ms</div>
+          </article>
+          <div class="wire">
+            <span class="dim">38ms</span>
+            <svg width="96" height="22" viewBox="0 0 96 22" fill="none" aria-hidden="true">
+              <path d="M2 11h80" stroke="#153B44" stroke-width="1.3" stroke-dasharray="6 4"/>
+              <path d="M78 5l9 6-9 6" stroke="#153B44" stroke-width="1.3" fill="none"/>
+            </svg>
+          </div>
+          <article class="part">
+            <span class="code">SK-02</span>
+            <h3>文本转换 · 大写</h3>
+            <div class="sub">text-transform @ 1.0.0</div>
+            <div class="st">检验通过 · 21ms</div>
+          </article>
+          <div class="wire">
+            <span class="dim">21ms</span>
+            <svg width="96" height="22" viewBox="0 0 96 22" fill="none" aria-hidden="true">
+              <path d="M2 11h80" stroke="#153B44" stroke-width="1.3" stroke-dasharray="6 4"/>
+              <path d="M78 5l9 6-9 6" stroke="#153B44" stroke-width="1.3" fill="none"/>
+            </svg>
+          </div>
+          <article class="part">
+            <span class="code">SK-03</span>
+            <h3>写入文件</h3>
+            <div class="sub">file-writer @ 1.0.0</div>
+            <div class="st">检验通过 · 353ms</div>
+          </article>
+        </div>
+        <p class="note">输入绑定 <b>text → echo.text</b> ｜ 顺序调度 · 稳定拓扑序 ｜ 同一版本可重复执行</p>
+      </div>
+    </section>
+
+    <!-- 明细表 -->
+    <section class="zone">
+      <div class="zone-cap"><span class="no">表 B</span><h2>零 件 明 细</h2><span class="en">BILL OF SKILLS</span></div>
+      <div class="tscroll"><table class="bom">
+        <thead><tr><th>NO.</th><th>SKILL</th><th>版本</th><th>权限</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">SK-01</td><td class="mono">echo</td><td class="mono">1.0.0</td><td class="mono">—</td></tr>
+          <tr><td class="mono">SK-02</td><td class="mono">text-transform</td><td class="mono">1.0.0</td><td class="mono">—</td></tr>
+          <tr><td class="mono">SK-03</td><td class="mono">file-writer</td><td class="mono">1.0.0</td><td class="mono"><span class="req">file:write</span></td></tr>
+        </tbody>
+      </table></div>
+      <div style="margin-top:16px">
+        <div class="zone-cap" style="margin-bottom:10px"><span class="no">注 C</span><h2 style="letter-spacing:.1em;font-size:13px">技 术 要 求</h2></div>
+        <ol style="font-size:12.5px;color:var(--ink-soft);padding-left:18px;line-height:1.9">
+          <li>发布后版本文件不可覆盖，Run 持有契约快照。</li>
+          <li>执行前必须通过静态校验与输入绑定检查。</li>
+          <li>Artifact 路径越界判 E503，节点失败集中重试。</li>
+        </ol>
+      </div>
+    </section>
+  </div>
+
+  <div class="foot">
+    <!-- 检验记录 -->
+    <section class="zone" style="position:relative">
+      <div class="zone-cap"><span class="no">表 D</span><h2>运 行 检 验 记 录</h2><span class="en">RUN LOG / IMMUTABLE</span></div>
+      <div class="rec" style="position:relative">
+        <div class="stamp">本批合格<small>RUN PASSED</small></div>
+        <div class="tscroll"><table>
+          <thead><tr><th>RUN 编号</th><th>TRACE</th><th>结论</th><th>耗时</th><th>时间</th></tr></thead>
+          <tbody>
+            <tr class="latest"><td class="mono">run_9f2ka</td><td class="mono">7f42c1e0</td><td class="verdict pass">合格</td><td class="mono">412ms</td><td class="mono">03:41</td></tr>
+            <tr><td class="mono">run_7wx1e</td><td class="mono">b2108d4f</td><td class="verdict pass">合格</td><td class="mono">398ms</td><td class="mono">03:39</td></tr>
+            <tr><td class="mono">run_5dq8m</td><td class="mono">c98e33a1</td><td class="verdict fail">不合格</td><td class="mono">102ms</td><td class="mono">03:36</td></tr>
+            <tr><td class="mono">run_3csnt</td><td class="mono">d04fa7b2</td><td class="verdict hold">待复核</td><td class="mono">—</td><td class="mono">03:31</td></tr>
+            <tr><td class="mono">run_1ab0z</td><td class="mono">e7c15d68</td><td class="verdict pass">合格</td><td class="mono">405ms</td><td class="mono">03:28</td></tr>
+          </tbody>
+        </table></div>
+        <p class="note" style="text-align:left;margin-top:10px">不合格说明：run_5dq8m 于 SK-03 判定 E503（artifact 路径越界），已终止。</p>
+      </div>
+    </section>
+
+    <!-- 图签 -->
+    <section class="zone">
+      <div class="zone-cap"><span class="no">栏 E</span><h2>图 签</h2><span class="en">TITLE BLOCK</span></div>
+      <div class="tblock">
+        <div><span class="k">编制 DRAWN</span><span class="v">WorkflowHub</span></div>
+        <div><span class="k">日期 DATE</span><span class="v">2026-10-03</span></div>
+        <div><span class="k">图号 DWG NO.</span><span class="v">WFH-TTF-001</span></div>
+        <div><span class="k">审核 CHECKED</span><span class="v">Agent Runtime</span></div>
+        <div><span class="k">比例 SCALE</span><span class="v">1 : 1</span></div>
+        <div><span class="k">版本 REV.</span><span class="v">1</span></div>
+        <div><span class="k">材料 MATERIAL</span><span class="v">Python 3.12</span></div>
+        <div><span class="k">数量 NODES</span><span class="v">3</span></div>
+        <div><span class="k">图幅 SHEET</span><span class="v">A3</span></div>
+      </div>
+    </section>
+  </div>
+</div>
+</body>
+</html>
