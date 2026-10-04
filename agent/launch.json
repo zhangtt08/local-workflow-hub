@@ -1,0 +1,23 @@
+{
+  "_comment": "本项目不新增 agent 进程，也不新增端口：契约四端点就挂在项目自己的 FastAPI 服务上（backend/workflowhub/legacy_agent_api.py）。所以这里的 command 就是项目真实的启动命令，验收器与 MCP 客户端按它把服务拉起来。",
+  "command": "python",
+  "args": ["-m", "workflowhub", "serve", "--port", "8794"],
+  "cwd": "backend",
+  "_cwd_note": "包在 backend/ 下（pyproject 的 package-dir 是 {\"\" = \"backend\"}，但没装成 wheel），从仓库根起 python -m workflowhub 会 import 不到，所以必须在 backend/ 里起。数据根不依赖 cwd：bootstrap.PROJECT_ROOT 是按 __file__ 往上两级的绝对路径。",
+  "ready_port": 8794,
+  "_port_note": "8794 是 serve 模式的固定端口；8000 归声析（vocal）的常驻后端，两边不能抢。桌面端 WorkflowHub.exe 起的是随机端口，并把地址写进 data/desktop.json，个人 Agent 侧按 WORKFLOWHUB_BASE → desktop.json → 8794 依次发现。",
+  "health_path": "/api/health",
+  "tools_path": "/api/agent/tools",
+  "manifest_path": "/api/agent/manifest",
+  "call_path": "/api/agent/tool",
+  "tools_limit": 1000,
+  "_tools_limit": "GET /api/agent/tools 默认只给 200 条（本机目录 1500+），验收器按这一页判「有没有只读工具」会误报，所以取满一页上限 1000。",
+  "probe_tool_query": "echo",
+  "_probe_tool": "验收器真跑一次只读探路。目录里的 read 面全是本机可执行文件，不能让它在业主机器上随手挑一条没审过的命令跑，所以点名只用 echo 这一类不落地做事的。",
+  "mcp": {
+    "command": "python",
+    "args": ["-m", "workflowhub", "mcp"],
+    "_note": "直接用项目自带的 MCP stdio 服务（backend/workflowhub/mcp_server.py）。不再另写一层 node 桥：那会变成第二份要跟着 catalog 同步的实现。"
+  },
+  "_token_note": "设了 WORKFLOWHUB_TOKEN 环境变量时，/api/ 全部要带 X-WorkflowHub-Token 头；本机默认不设，四端点即开即用。"
+}

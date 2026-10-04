@@ -50,10 +50,15 @@ class LegacyAgentApiTests(unittest.TestCase):
     def test_01_tools_descriptor_uses_shared_risk_vocabulary(self):
         listed = self.client.get("/api/agent/tools", params={"query": "report", "limit": 100}).json()
         self.assertTrue(listed["ok"])
-        row = next((i for i in listed["data"] if i["name"] == TOOL), None)
-        self.assertIsNotNone(row, "/api/agent/tools 的搜索没把脚本工具放进来")
+        # 共享契约要求 name 全局唯一（带 `<project-id>.` 前缀），原始目录 key 另放 catalogue_key。
+        row = next((i for i in listed["data"] if i["name"] == f"workflowhub.{TOOL}"), None)
+        self.assertIsNotNone(row, "/api/agent/tools 的搜索没把脚本工具放进来，或名字没带项目前缀")
+        self.assertEqual(row["catalogue_key"], TOOL)
         self.assertEqual(row["risk"], "destructive")
         self.assertFalse(row["input_schema"]["additionalProperties"])
+        # destructive 必须把确认入参报出来：调用方只看 schema 就该知道"这一步有副作用"
+        self.assertIn("confirm", row["input_schema"]["properties"],
+                      "有副作用的工具没在 schema 里报出 confirm 入参")
         self.assertIn("argv", row["input_schema"]["properties"])
         self.assertIn("脚本要求必填", row["input_schema"]["properties"]["input"]["description"])
 
@@ -76,7 +81,7 @@ class LegacyAgentApiTests(unittest.TestCase):
         self.assertIn("failed_command", data["conventions"])
 
     def test_04_invoke_accepts_key_and_function_name_spellings(self):
-        for name in (TOOL, TOOL.replace("-", "_"),
+        for name in (TOOL, TOOL.replace("-", "_"), f"workflowhub.{TOOL}",
                      self.hub.catalog.to_skill(TOOL).id.replace("-", "_")):
             result = self.client.post("/api/agent/tool",
                                       json={"tool": name, "input": {"dry_run": True, "input": "hi"}})
@@ -84,11 +89,37 @@ class LegacyAgentApiTests(unittest.TestCase):
             self.assertEqual(result.json()["catalog_key"], TOOL)
             self.assertIn("command_line", result.json()["data"]["outputs"])
 
+    def test_06_confirm_is_the_contracts_name_for_the_same_approval_gate(self):
+        """契约的 confirm 只是本项目审批门 approved 的另一个名字 —— 判定本身一点不许放宽。"""
+        settings = self.hub.catalog.settings
+        before = dict(settings)
+        settings["approval_mode"] = True
+        try:
+            plain = self.client.post("/api/agent/tool",
+                                     json={"tool": f"workflowhub.{TOOL}", "input": {"dry_run": True, "input": "hi"}})
+            self.assertEqual(plain.json()["error"]["code"], "awaiting_approval",
+                             "审批模式开着又不带确认，不该放行")
+            confirmed = self.client.post("/api/agent/tool",
+                                         json={"tool": f"workflowhub.{TOOL}",
+                                               "input": {"dry_run": True, "input": "hi", "confirm": True}})
+            self.assertTrue(confirmed.json()["ok"], f"confirm=true 应当走通同一道门：{confirmed.json()}")
+            legacy = self.client.post("/api/agent/tool",
+                                      json={"tool": TOOL, "input": {"dry_run": True, "input": "hi", "approved": True}})
+            self.assertTrue(legacy.json()["ok"], f"老写法 approved=true 不能被打断：{legacy.json()}")
+            refused = self.client.post("/api/agent/tool",
+                                       json={"tool": TOOL, "input": {"dry_run": True, "input": "hi", "confirm": False}})
+            self.assertEqual(refused.json()["error"]["code"], "awaiting_approval",
+                             "confirm=false 就是不批准，不能当成省略号放过")
+        finally:
+            settings.clear()
+            settings.update(before)
+
     def test_05_bad_requests_keep_the_legacy_error_envelope(self):
         unknown = self.client.post("/api/agent/tool", json={"tool": "no-such-tool"})
         self.assertEqual(unknown.status_code, 400)
         self.assertEqual(unknown.json()["error"]["code"], "unknown_tool")
-        self.assertTrue(unknown.json()["available"])
+        # available 在 error 里：生态验收器与调用方都是在 error 上找可用名单的
+        self.assertTrue(unknown.json()["error"]["available"], "unknown_tool 没给出可用名单")
         undeclared = self.client.post("/api/agent/tool", json={"tool": TOOL, "input": {"bogus": 1}})
         self.assertEqual(undeclared.status_code, 400)
         self.assertEqual(undeclared.json()["error"]["code"], "bad_input")

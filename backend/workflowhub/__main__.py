@@ -161,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = sub.add_parser("serve", help="只启动 HTTP 服务")
     serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--port", type=int, default=8794)
     serve.set_defaults(func=cmd_serve)
 
     desktop = sub.add_parser("desktop", help="启动桌面窗口（无边框，窗口控件在界面内）")

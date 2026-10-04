@@ -17,6 +17,7 @@ from uuid import uuid4
 from .discovery import DEFAULT_ROOTS, Candidate, probe_version, run_scan, slug
 from .errors import WorkflowHubError
 from .persistence import atomic_replace
+from .redaction import redact, redact_event
 from .models import (
     ErrorCode,
     Permission,
@@ -47,8 +48,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "high_risk_enabled": True,
     "max_output_bytes": 200_000,
     "default_timeout_seconds": 120,
+    # 并发是明说的策略而不是巧合：默认允许同一个工具被同时调用（这台机器上多数命令互不相干）。
+    # 会在同一个目录里写同一批文件的工具，在详情页勾上 exclusive 让它们排队。
+    "allow_concurrent": True,
     "telemetry": False,
 }
+
+#: 审计索引一次最多读这么多字节；超过就只索引尾部并在 stats 里如实标出来，
+#: 免得一次几个 GB 的 audit.jsonl 把启动与健康检查拖死（这条是这个项目自己踩过的）。
+AUDIT_SCAN_LIMIT = 32_000_000
+#: recent_activity 在内存里保留的行数
+AUDIT_ROWS_KEPT = 2_000
 
 
 class ToolCatalog:
@@ -67,8 +77,20 @@ class ToolCatalog:
         self.last_scan: dict[str, Any] = {}
         self.scan_errors: list[str] = []
         self._scan_state: dict[str, Any] = {"running": False, "phase": "", "found": 0}
-        #: (audit 文件的 mtime/size, 尾部行, 每工具统计索引)；审计只在文件变化时重读一次
-        self._audit_cache: tuple[tuple[int, int], list[dict[str, Any]], dict[str, tuple[int, str | None]]] | None = None
+        # ── 审计账本的内存视图 ────────────────────────────────────────────────
+        # 一条调用只读它自己那几十字节（_audit_pos 是已消费到的位置），计数却是全量的；
+        # 行数只留最近 AUDIT_ROWS_KEPT 条，避免流水涨到几十 MB 时把界面拖死。
+        self._audit_lock = threading.RLock()
+        self._audit_stamp: tuple[int, int] | None = None
+        self._audit_rows_buf: list[dict[str, Any]] = []
+        self._audit_index_buf: dict[str, tuple[int, str | None]] = {}
+        self._audit_pos = 0
+        # 必须在构造里就初始化：_audit_reset() 只在"文件不存在/被截断"那两条分支上才会跑到。
+        # 真实机器上 data/audit.jsonl 是一直存在的，于是第一次 _audit_tail() 直接读这个属性就
+        # AttributeError —— 测试里用临时空目录躲过了，凡是读调用计数的端点（含 /api/agent/tools）
+        # 在现网全部 500。判据同一条：凡是被 _audit_reset 设过的字段，构造里也要设一遍。
+        self._audit_resync = False
+        self._audit_windowed = False
         self.load()
 
     # ── persistence ────────────────────────────────────────────────────────────
@@ -153,7 +175,8 @@ class ToolCatalog:
 
     # ── reading ────────────────────────────────────────────────────────────────
     def state_for(self, key: str) -> dict[str, Any]:
-        return self.state.setdefault(key, {"enabled": True, "starred": False, "notes": "", "alias": ""})
+        return self.state.setdefault(key, {"enabled": True, "starred": False, "notes": "", "alias": "",
+                                           "exclusive": False})
 
     def is_enabled(self, key: str) -> bool:
         tool = self.tools.get(key)
@@ -173,6 +196,7 @@ class ToolCatalog:
         state = self.state_for(key)
         merged = {**tool, "enabled": self.is_enabled(key), "starred": state.get("starred", False),
                   "notes": state.get("notes", ""), "alias": state.get("alias", ""), "key": key,
+                  "exclusive": bool(state.get("exclusive", False)),
                   "invocable": bool(tool.get("command")),
                   "blueprint": not bool(tool.get("command")),
                   "call_hint": (None if tool.get("command") else
@@ -314,13 +338,15 @@ class ToolCatalog:
         with self._lock:
             for k, v in patch.items():
                 if k not in DEFAULT_SETTINGS:
-                    continue
+                    continue                      # 未知键由 API 如实报出来，不在这里悄悄收下
                 if k == "scan_roots":
                     v = [str(Path(str(x))) for x in v if str(x).strip()]
                 if k == "max_output_bytes":
                     v = max(2_000, min(int(v), 2_000_000))
                 if k == "default_timeout_seconds":
                     v = max(1, min(float(v), 3600))
+                if isinstance(DEFAULT_SETTINGS[k], bool):
+                    v = bool(v)
                 self.settings[k] = v
             self.save()
             return dict(self.settings)
@@ -336,7 +362,7 @@ class ToolCatalog:
         with self._lock:
             self.tools[key]["probe"] = {**result, "at": _now()}
             self.save()
-        return {"ok": bool(result["probe_flag"]), **result}
+        return {"ok": bool(result["probe_flag"]), **result, "command_line": " ".join(command)}
 
     # ── Skill contract view ────────────────────────────────────────────────────
     def to_skill(self, key: str) -> SkillDefinition:
@@ -469,45 +495,122 @@ class ToolCatalog:
 
     # ── audit + approvals ──────────────────────────────────────────────────────
     def audit(self, event: dict[str, Any]) -> None:
-        event = {"at": _now(), **event}
+        """写一条审计：**先脱敏再落盘**。
+
+        审计文件是给人读的，也会从 /api/v1/activity 与工具详情页返回；env 的值与密钥形状的参数
+        只该出现在真正执行的那一份里，不该出现在账本里。
+        """
+        record = redact_event({"at": _now(), **event})
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.audit_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        with self._audit_lock:
+            with self.audit_path.open("a", encoding="utf-8") as stream:
+                stream.write(line)
 
     def _audit_rows(self, limit: int = 400) -> list[dict[str, Any]]:
         return list(reversed(self._audit_tail()))[:limit]
 
     def _audit_tail(self) -> list[dict[str, Any]]:
-        """审计尾部 + 每工具统计按 (mtime, size) 缓存。
+        """审计尾部 + 每工具统计：按 (mtime, size) 判脏，脏了只读**新增的那几个字节**。
 
-        以前每个工具的 `invocations` 都重新读一遍并 JSON 解析整个尾部，目录有 1,500 条时
-        `/health` 与工具页要几十秒才回 —— 桌面端因此被误判成"本地服务启动失败"。
+        两笔账都要算对：
+
+        ① 目录 1,500 条时，每条工具各重读一遍审计文件会把 `/health` 拖到桌面端判定"启动失败"
+           （真机踩过，`tests/test_catalog.py` 里有性能门禁）；
+        ② 只数最后 400 行，"调用次数"就只是最近窗口而不是总次数 —— 列表里写着 ×N 就得是数出来的 N。
+           现在一次调用只多读它那一条记录，计数仍然是全量的，内存里的行数另设上限。
         """
-        try:
-            stat = self.audit_path.stat()
+        with self._audit_lock:
+            try:
+                stat = self.audit_path.stat()
+            except OSError:
+                self._audit_reset()
+                return []
             stamp = (int(stat.st_mtime_ns), int(stat.st_size))
-        except OSError:
-            return []
-        if self._audit_cache is None or self._audit_cache[0] != stamp:
-            lines = self.audit_path.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]
-            rows = []
-            for line in lines:
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-            index: dict[str, tuple[int, str | None]] = {}
-            for row in rows:  # 文件顺序：旧 → 新，末次时间就是最后一次赋值
+            if self._audit_stamp == stamp:
+                return self._audit_rows_buf
+
+            start = self._audit_pos
+            if stat.st_size < start:            # 文件被换过/截断过：整本重数
+                self._audit_reset()
+                start = 0
+            if start == 0 and stat.st_size > AUDIT_SCAN_LIMIT:
+                # 一上来就几十 MB：为了一次计数读完不值当，退到尾部窗口并如实标 windowed
+                start = stat.st_size - AUDIT_SCAN_LIMIT
+                self._audit_windowed = True
+                # 窗口起点落在文件中间，那一行是半截的：不丢掉就会被当成一条真记录，
+                # 计数与"最后一次调用时间"都会错上一条。续读分支不需要丢（pos 停在行首）。
+                self._audit_resync = True
+            new_rows, leftover = self._audit_read_forward(start, stat.st_size, drop_first=self._audit_resync)
+            self._audit_pos = max(start, stat.st_size - leftover)
+            self._audit_resync = False          # 现在停在行首了，下一次续读不用再丢半行
+            self._audit_stamp = stamp
+            for row in new_rows:                # 文件顺序旧→新，末次时间就是最后一次赋值
+                self._audit_rows_buf.append(row)
                 tool = row.get("tool")
                 if tool:
-                    count, _ = index.get(tool, (0, None))
-                    index[tool] = (count + 1, row.get("at"))
-            self._audit_cache = (stamp, rows, index)
-        return self._audit_cache[1]
+                    count, _ = self._audit_index_buf.get(tool, (0, None))
+                    self._audit_index_buf[tool] = (count + 1, row.get("at"))
+            del self._audit_rows_buf[:-AUDIT_ROWS_KEPT]   # 只限内存里的行数，计数不受影响
+            return self._audit_rows_buf
+
+    def _audit_read_forward(self, start: int, size: int, drop_first: bool = False
+                            ) -> tuple[list[dict[str, Any]], int]:
+        """读 [start, size) 里的**完整行**，返回 (记录, 还没写完的尾部字节数)。
+
+        按字节走、不按字符：审计是并发追加的，一条记录可能正被写到一半。把半行数进次数、
+        或者把它算成已消费的位置，账本就会悄悄错一位并且再也对不上。
+        ``drop_first`` 只在从文件中间起读时为真（那一行是半截的）；续读时位置本来就停在行首。
+        """
+        if size <= start:
+            return [], 0
+        with self.audit_path.open("rb") as stream:
+            stream.seek(start)
+            chunk = stream.read(size - start)
+        if drop_first:
+            cut = chunk.find(b"\n")
+            if cut < 0:
+                return [], len(chunk)
+            chunk = chunk[cut + 1:]
+        leftover = 0
+        if chunk and not chunk.endswith(b"\n"):
+            last = chunk.rfind(b"\n")
+            leftover = len(chunk) - (last + 1) if last >= 0 else len(chunk)
+            chunk = chunk[:last + 1] if last >= 0 else b""
+        out: list[dict[str, Any]] = []
+        for line in chunk.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out, leftover
+
+    def _audit_reset(self) -> None:
+        self._audit_stamp = None
+        self._audit_rows_buf = []
+        self._audit_index_buf = {}
+        self._audit_pos = 0
+        self._audit_resync = False
+        self._audit_windowed = False
 
     def _audit_index(self) -> dict[str, tuple[int, str | None]]:
         self._audit_tail()
-        return self._audit_cache[2] if self._audit_cache else {}
+        return self._audit_index_buf
+
+    def audit_stats(self) -> dict[str, Any]:
+        """审计这本账本身：多大、内存里留了几行、计数是不是只看了尾部。"""
+        rows = self._audit_tail()
+        try:
+            size = int(self.audit_path.stat().st_size)
+        except OSError:
+            size = 0
+        return {"bytes": size, "rows_in_memory": len(rows), "tools_counted": len(self._audit_index_buf),
+                "windowed": bool(self._audit_windowed),
+                "note": ("审计文件超过 32MB，计数只覆盖尾部窗口" if self._audit_windowed
+                         else "调用次数按 audit.jsonl 全量统计")}
 
     def invocation_count(self, key: str) -> int:
         return self._audit_index().get(key, (0, None))[0]
@@ -515,8 +618,18 @@ class ToolCatalog:
     def last_invocation(self, key: str) -> str | None:
         return self._audit_index().get(key, (0, None))[1]
 
-    def recent_activity(self, limit: int = 40) -> list[dict[str, Any]]:
-        return self._audit_rows(limit)
+    def recent_activity(self, limit: int = 40, tool: str | None = None, actor: str | None = None,
+                        event_type: str | None = None) -> list[dict[str, Any]]:
+        """最近的审计流水。企业用法是"查某把工具/某个调用方最近干了什么"，
+        所以过滤在取数之后、截断之前做 —— 不然翻 40 条找 1 条等于没给。"""
+        if tool or actor or event_type:
+            rows = [r for r in reversed(self._audit_tail())
+                    if (not tool or r.get("tool") == tool)
+                    and (not actor or r.get("actor") == actor)
+                    and (not event_type or r.get("type") == event_type)]
+        else:
+            rows = self._audit_rows(max(limit, 40))
+        return rows[:max(limit, 1)]
 
     def needs_approval(self, key: str) -> bool:
         if not self.settings["approval_mode"]:
@@ -524,17 +637,26 @@ class ToolCatalog:
         tool = self.tools.get(key) or {}
         return tool.get("risk") == "high"
 
-    def create_approval(self, key: str, payload: dict[str, Any], requester: str) -> dict[str, Any]:
+    def create_approval(self, key: str, payload: dict[str, Any], requester: str,
+                        preview: dict[str, Any] | None = None) -> dict[str, Any]:
+        """审批单落 catalog.json，所以它**先脱敏再存**：批准的人在窗口里看的是要点，不是密钥。
+
+        ``preview`` 里带真正会执行的命令行 —— 只有原始 inputs 的话，批准的人看不到这条命令
+        最终长成什么样，审批就退化成"点一下同意"。
+        """
         token = uuid4().hex[:12]
         record = {
-            "id": token, "tool": key, "payload": payload, "requested_by": requester,
-            "status": "pending", "created_at": _now(), "decided_at": None, "title": (self.tools.get(key) or {}).get("title", key),
+            "id": token, "tool": key, "payload": redact(dict(payload)), "requested_by": requester,
+            "status": "pending", "created_at": _now(), "decided_at": None,
+            "title": (self.tools.get(key) or {}).get("title", key),
             "risk": (self.tools.get(key) or {}).get("risk", "unknown"),
+            **(preview or {}),
         }
         with self._lock:
             self.approvals[token] = record
             self.save()
-        self.audit({"type": "approval_requested", "tool": key, "approval": token, "actor": requester})
+        self.audit({"type": "approval_requested", "tool": key, "approval": token, "actor": requester,
+                    "command_line": record.get("command_line")})
         return record
 
     def decide_approval(self, token: str, approve: bool, actor: str = "user") -> dict[str, Any]:

@@ -15,7 +15,7 @@ function calling / CLI / 旧契约四端点** 五种方式交给 AI Agent 直接
 | --- | --- | --- |
 | 桌面 exe | **`WorkflowHub.exe`（就在这个文件夹根目录，39 MB 单文件）** | 双击即用；首次运行自动扫描本机并生成 `data/`。要给别人只拷这一个文件即可 |
 | 源码运行 | `python -m workflowhub desktop` | 需要 Python 3.12 + `pip install -e .` |
-| 仅服务 | `python -m workflowhub serve --port 8000` | 只跑 HTTP API，浏览器打开 `http://127.0.0.1:8000` |
+| 仅服务 | `python -m workflowhub serve --port 8794` | 只跑 HTTP API，浏览器打开 `http://127.0.0.1:8794` |
 | MCP 服务 | `python -m workflowhub mcp` 或 `WorkflowHub.exe --mcp` | STDIO，给支持 MCP 的 Agent 直接挂 |
 
 exe 用系统里已有的 Edge/Chromium 打开窗口（不内置浏览器，所以是单个 39.5 MB 的 exe）。
@@ -25,21 +25,21 @@ exe 用系统里已有的 Edge/Chromium 打开窗口（不内置浏览器，所�
 ## Agent 接入（最短路径）
 
 ```bash
-curl -s http://127.0.0.1:8000/api/v1/agent/info          # 端点、鉴权、目录规模
-curl -s "http://127.0.0.1:8000/api/v1/tools?query=ffmpeg&limit=5"
-curl -s -X POST http://127.0.0.1:8000/api/v1/tools/cli-ffmpeg/invoke \
+curl -s http://127.0.0.1:8794/api/v1/agent/info          # 端点、鉴权、目录规模
+curl -s "http://127.0.0.1:8794/api/v1/tools?query=ffmpeg&limit=5"
+curl -s -X POST http://127.0.0.1:8794/api/v1/tools/cli-ffmpeg/invoke \
      -H "Content-Type: application/json" \
      -d '{"inputs":{"argv":["-version"],"dry_run":true}}'   # 先看会执行什么，再真跑
-curl -s http://127.0.0.1:8000/api/v1/tools.json > tools.json  # 直接喂给 function calling
+curl -s http://127.0.0.1:8794/api/v1/tools.json > tools.json  # 直接喂给 function calling
 ```
 
 其余项目早已习惯另一套四端点契约，这里也照原样提供（同一批工具、同一套闸门）：
 
 ```bash
-curl -s http://127.0.0.1:8000/api/health           # {ok, status, data:{project, tools, gates…}}
-curl -s "http://127.0.0.1:8000/api/agent/tools?limit=50&offset=0"
-curl -s http://127.0.0.1:8000/api/agent/manifest
-curl -s -X POST http://127.0.0.1:8000/api/agent/tool \
+curl -s http://127.0.0.1:8794/api/health           # {ok, status, data:{project, tools, gates…}}
+curl -s "http://127.0.0.1:8794/api/agent/tools?limit=50&offset=0"
+curl -s http://127.0.0.1:8794/api/agent/manifest
+curl -s -X POST http://127.0.0.1:8794/api/agent/tool \
      -H "Content-Type: application/json" \
      -d '{"tool":"cli_ffmpeg","input":{"argv":["-version"],"dry_run":true}}'
 ```
