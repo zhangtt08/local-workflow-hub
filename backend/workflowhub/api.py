@@ -713,4 +713,22 @@ def create_app(hub: Hub | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+#: 模块级 `app` 改成按需构造（PEP 562）。
+#:
+#: 为什么不能在导入时就建：`create_app()` 会 `build_hub()` 到**真实的 data/**，而这一轮的
+#: `create_app` 还要保证本机口令存在 —— 于是"任何人 import 一次 workflowhub.api"
+#: （跑一遍测试就算）都会往用户的数据目录里写一把口令。规则写死了测试与导入都不许动真实
+#: `data/`，所以这条路只能延迟到真有人要它的时候。
+#: `python -m workflowhub serve` 与桌面端都按**对象**传 app（见 `__main__.cmd_serve` 里那条
+#: 注释：字符串起法会让 uvicorn 再 import 一次模块、第二次 build_hub 真实目录），
+#: 这里留着只为 `uvicorn workflowhub.api:app` 那种外部起法，用时再建，一个字节都不差。
+_app_singleton: FastAPI | None = None
+
+
+def __getattr__(name: str) -> Any:
+    global _app_singleton
+    if name != "app":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if _app_singleton is None:
+        _app_singleton = create_app()
+    return _app_singleton
