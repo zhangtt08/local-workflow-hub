@@ -10,6 +10,7 @@ from typing import Any
 
 from .errors import WorkflowHubError
 from .models import ErrorCode, WorkflowDefinition, WorkflowRun
+from .redaction import redact_event, redact_run_record
 
 #: Windows rename 会被瞬时共享锁挡住（杀软、索引器、另一进程刚打开过同名文件）
 _REPLACE_SCHEDULE = (0.0, 0.05, 0.15, 0.35, 0.7)
@@ -73,7 +74,9 @@ class FileRunRepository:
     def save(self, run: WorkflowRun) -> None:
         path = self.root / f"{_safe_key(run.id)}.json"
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(run.model_dump_json(indent=2), encoding="utf-8")
+        # 落盘前脱敏：env 值与密钥形状的参数只用于这一次执行，不进记录、不进返回值。
+        payload = redact_run_record(json.loads(run.model_dump_json()))
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         atomic_replace(temporary, path)
 
     def get(self, run_id: str) -> WorkflowRun | None:

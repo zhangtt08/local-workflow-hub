@@ -43,6 +43,7 @@ class ScanRequest(BaseModel):
 class ToolStateRequest(BaseModel):
     enabled: bool | None = None
     starred: bool | None = None
+    exclusive: bool | None = None
 
 
 class NoteRequest(BaseModel):
@@ -236,11 +237,11 @@ def create_app(hub: Hub | None = None) -> FastAPI:
         if key not in hub.catalog.tools:
             raise not_found("工具", key)
         if not body.wait:
-            return services.start_background_invoke(hub, key, body.inputs, body.actor)
-        return await services.invoke_tool(hub, key, body.inputs, body.actor)
+            return services.start_background_invoke(hub, key, body.inputs, body.actor, "rest")
+        return await services.invoke_tool(hub, key, body.inputs, body.actor, "rest")
 
     @app.post("/api/v1/tools/{key}/adopt")
-    def adopt_skill_package(key: str) -> dict[str, Any]:
+    def adopt_skill_package(key: str, actor: str = "ui") -> dict[str, Any]:
         try:
             result = hub.catalog.adopt_skill_package(key, hub.roots["skills"])
         except KeyError as exc:
@@ -250,23 +251,33 @@ def create_app(hub: Hub | None = None) -> FastAPI:
         except Exception as exc:
             raise WorkflowHubError(ErrorCode.EXECUTOR_ERROR, f"接入失败：{exc}") from exc
         hub.registry.refresh()
+        hub.catalog.audit({"type": "tool_adopt", "tool": key, "actor": actor, "path": result["path"]})
         return {**result, "skills_now": len(hub.directory.list()),
                 "hint": "已复制到 skills/，现在可以像手写 Skill 一样编排进 Workflow"}
 
     @app.post("/api/v1/tools/{key}/probe")
-    def probe(key: str) -> dict[str, Any]:
+    def probe(key: str, actor: str = "ui") -> dict[str, Any]:
+        """探测版本会**真的跑一次**这条命令（带 --version），所以同样要进审计。"""
         try:
-            return hub.catalog.probe(key)
+            result = hub.catalog.probe(key)
         except KeyError as exc:
             raise not_found("工具", key) from exc
+        hub.catalog.audit({"type": "probe", "tool": key, "actor": actor,
+                           "command_line": result.get("command_line"), "ok": result.get("ok")})
+        return result
 
     @app.patch("/api/v1/tools/{key}/state")
-    def tool_state(key: str, body: ToolStateRequest) -> dict[str, Any]:
+    def tool_state(key: str, body: ToolStateRequest, actor: str = "ui") -> dict[str, Any]:
         try:
             row = dict(hub.catalog.record(key) or {})
-            for flag, value in (("enabled", body.enabled), ("starred", body.starred)):
+            for flag, value in (("enabled", body.enabled), ("starred", body.starred),
+                                ("exclusive", body.exclusive)):
                 if value is not None:
+                    before = row.get(flag)
                     row = hub.catalog.set_flag(key, flag, value)
+                    if before != value:
+                        hub.catalog.audit({"type": "tool_state", "tool": key, "actor": actor,
+                                           "flag": flag, "from": before, "to": value})
             hub.registry.refresh()
             return row
         except KeyError as exc:
@@ -282,17 +293,20 @@ def create_app(hub: Hub | None = None) -> FastAPI:
             raise WorkflowHubError(ErrorCode.INPUT_ERROR, str(exc)) from exc
 
     @app.post("/api/v1/tools")
-    def add_custom(body: CustomToolRequest) -> dict[str, Any]:
+    def add_custom(body: CustomToolRequest, actor: str = "ui") -> dict[str, Any]:
         try:
             row = hub.catalog.add_custom(body.model_dump())
         except ValueError as exc:
             raise WorkflowHubError(ErrorCode.INPUT_ERROR, str(exc)) from exc
         hub.registry.refresh()
+        hub.catalog.audit({"type": "tool_add", "tool": row.get("key") or row.get("id"), "actor": actor,
+                           "command_line": " ".join(body.command), "risk": row.get("risk")})
         return row
 
     @app.delete("/api/v1/tools/{key}")
-    def delete_tool(key: str) -> dict[str, str]:
+    def delete_tool(key: str, actor: str = "ui") -> dict[str, str]:
         try:
+            gone = dict(hub.catalog.record(key) or {})
             hub.catalog.remove(key)
         except KeyError as exc:
             raise not_found("工具", key) from exc
@@ -300,13 +314,17 @@ def create_app(hub: Hub | None = None) -> FastAPI:
             raise WorkflowHubError(ErrorCode.PERMISSION_ERROR, str(exc),
                                    {"hint": "扫描到的工具不能删除，可用 PATCH state 关闭"}) from exc
         hub.registry.refresh()
+        hub.catalog.audit({"type": "tool_remove", "tool": key, "actor": actor,
+                           "command_line": " ".join(gone.get("command") or [])})
         return {"status": "deleted", "key": key}
 
     # ── discovery + settings ───────────────────────────────────────────────
     @app.post("/api/v1/discovery/scan")
-    def scan(body: ScanRequest) -> dict[str, Any]:
+    def scan(body: ScanRequest, actor: str = "ui") -> dict[str, Any]:
         result = hub.catalog.scan(body.roots, wait=body.wait)
         hub.registry.refresh()
+        hub.catalog.audit({"type": "scan", "actor": actor, "roots": body.roots or hub.catalog.settings["scan_roots"],
+                           "result": result})
         return {"result": result, "stats": services.catalogue_stats(hub)}
 
     @app.get("/api/v1/discovery/status")
@@ -320,12 +338,39 @@ def create_app(hub: Hub | None = None) -> FastAPI:
         return {"settings": hub.catalog.settings, "defaults": DEFAULT_SETTINGS}
 
     @app.put("/api/v1/settings")
-    def put_settings(body: SettingsRequest) -> dict[str, Any]:
-        return {"settings": hub.catalog.update_settings(body.patch)}
+    def put_settings(body: SettingsRequest, actor: str = "ui") -> dict[str, Any]:
+        before = dict(hub.catalog.settings)
+        after = hub.catalog.update_settings(body.patch)
+        changed = {k: {"from": before.get(k), "to": after.get(k)} for k, v in body.patch.items()
+                   if after.get(k) != before.get(k)}
+        if changed:
+            # 改开关是要留痕的动作：谁把高风险放开、谁把审批关掉，事后要查得回
+            hub.catalog.audit({"type": "settings", "actor": actor, "changed": changed})
+        return {"settings": after, "changed": sorted(changed)}
 
     @app.get("/api/v1/activity")
-    def activity(limit: int = 40) -> dict[str, Any]:
-        return {"items": hub.catalog.recent_activity(limit)}
+    def activity(limit: int = 40, tool: str | None = None, actor: str | None = None,
+                 type: str | None = Query(None, alias="type")) -> dict[str, Any]:
+        """审计流水。查"这把工具最近被谁调过"要能按 tool/actor/type 过滤，
+        而不是让人在 40 条混合流水里肉眼找。"""
+        return {"items": hub.catalog.recent_activity(limit, tool=tool, actor=actor, event_type=type),
+                "filters": {"tool": tool, "actor": actor, "type": type},
+                "audit": hub.catalog.audit_stats()}
+
+    @app.get("/api/v1/tasks")
+    def tasks(running_only: bool = True) -> dict[str, Any]:
+        """当前/最近的任务与在跑的调用：长任务要看得见"还在跑、跑了多久、哪一步"。"""
+        rows = []
+        for task_id in list(services.TASKS):
+            state = services.task_state(task_id)
+            if state is None:
+                continue
+            if running_only and state.get("status") != "running":
+                continue
+            rows.append(state)
+        return {"items": sorted(rows, key=lambda r: r.get("started_at") or ""),
+                "live_calls": services.running_calls(),
+                "note": "elapsed_seconds 是本次调用已用时间；取消用 POST /api/v1/tasks/{id}/cancel"}
 
     @app.get("/api/v1/tasks/{task_id}")
     def task(task_id: str) -> dict[str, Any]:
@@ -333,6 +378,19 @@ def create_app(hub: Hub | None = None) -> FastAPI:
         if state is None:
             raise not_found("任务", task_id)
         return state
+
+    @app.post("/api/v1/tasks/{task_id}/cancel")
+    def cancel_task(task_id: str, actor: str = "ui") -> dict[str, Any]:
+        """真的停：掐掉协程 → 执行器按进程树杀掉命令及它自己派生的子进程。
+
+        只把状态改成 cancelled 不算停 —— 那样进程还在机器上跑，用户看到的"已取消"是假的。
+        """
+        result = services.cancel_task(task_id, actor)
+        if result is None:
+            raise not_found("任务", task_id)
+        hub.catalog.audit({"type": "task_cancel", "tool": result.get("tool"), "actor": actor,
+                           "task_id": task_id, "reason": result.get("reason")})
+        return result
 
     # ── approvals ──────────────────────────────────────────────────────────
     @app.get("/api/v1/approvals")

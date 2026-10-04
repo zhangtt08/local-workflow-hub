@@ -32,16 +32,63 @@ from .models import (
 GENERIC_INPUTS = {"argv", "flags", "stdin", "cwd", "env", "timeout_seconds", "dry_run", "approved"}
 TASKS: dict[str, dict[str, Any]] = {}
 TASK_TTL_SECONDS = 1800
+#: 正在跑的调用：key = catalog_key，值 = 每一次现场（谁在跑、什么时候开始、哪种入口）
+RUNNING: dict[str, list[dict[str, Any]]] = {}
+#: 标了 exclusive 的工具排队跑；别的默认放开（allow_concurrent 是设置里的明说策略）
+TOOL_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def running_calls(catalog_key: str | None = None) -> list[dict[str, Any]]:
+    """现在有几个调用在跑。界面与 /overview 用它区分"卡住"与"真的还在跑"。"""
+    now = time.time()
+    rows = []
+    for key, entries in RUNNING.items():
+        if catalog_key and key != catalog_key:
+            continue
+        for entry in entries:
+            rows.append({**entry, "tool": key,
+                         "elapsed_seconds": round(now - entry["_started"], 1)})
+    return sorted(rows, key=lambda r: r["_started"])
+
+
+def _tool_lock(key: str) -> asyncio.Lock:
+    lock = TOOL_LOCKS.get(key)
+    if lock is None:
+        lock = TOOL_LOCKS.setdefault(key, asyncio.Lock())
+    return lock
 
 
 def _prune_tasks() -> None:
     cutoff = time.time() - TASK_TTL_SECONDS
     for key in [k for k, v in TASKS.items() if v.get("_finished", 0) and v["_finished"] < cutoff]:
-        TASKS.pop(key, None)
+        dropped = TASKS.pop(key, None) or {}
+        handle = dropped.get("_handle")
+        # 收尾保险：条记录过期了但协程还活着，就把它收掉，别让子进程在后台无人认领地跑
+        if handle is not None and not handle.done():
+            handle.cancel()
+
+
+def resolve_call_timeout(inputs: dict[str, Any], default: float) -> float:
+    """调用方写的 timeout_seconds 要么可用、要么当场说清为什么不行。
+
+    以前这里 `float(...)` 不做范围检查，越界的值随后在 executor 里被 `min()` 悄悄夹住：
+    Agent 要 7200s 实际得到 3600s，要 0s 实际得到默认值，谁都不知道 —— 判据只留一处，
+    就是 `command_executor.check_timeout_range`。
+    """
+    from .command_executor import check_timeout_range
+
+    raw = inputs.get("timeout_seconds")
+    if raw in (None, ""):
+        return float(default)
+    return check_timeout_range(raw)
 
 
 def call_plan(hub: Hub, catalog_key: str, inputs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, ValueSpec], float]:
     """Split caller inputs into skill-declared fields plus call options, with a timeout."""
+    if not isinstance(inputs, dict):
+        raise WorkflowHubError(ErrorCode.INPUT_ERROR,
+                               f"inputs 需要 JSON 对象，收到：{type(inputs).__name__}",
+                               {"hint": '形如 {"argv": ["--version"], "dry_run": true}'})
     skill = hub.catalog.to_skill(catalog_key)
     declared = dict(skill.inputs)
     raw_flags = inputs.get("flags") or {}
@@ -70,8 +117,8 @@ def call_plan(hub: Hub, catalog_key: str, inputs: dict[str, Any]) -> tuple[dict[
                                f"未声明的输入：{', '.join(unknown)}",
                                {"unknown": unknown, "declared": sorted(declared),
                                 "options": sorted(GENERIC_INPUTS - {"approved"})})
-    timeout = float(inputs.get("timeout_seconds") or skill.timeout_seconds)
-    return fields, declared, min(timeout, 3600.0)
+    timeout = resolve_call_timeout(inputs, skill.timeout_seconds)
+    return fields, declared, timeout
 
 
 def _match_field(declared: dict[str, ValueSpec], raw_name: str) -> str | None:
@@ -106,7 +153,34 @@ def single_tool_workflow(skill_id: str, skill_version: str, declared: dict[str, 
     )
 
 
-async def invoke_tool(hub: Hub, catalog_key: str, inputs: dict[str, Any], actor: str = "agent") -> dict[str, Any]:
+def _track_start(key: str, actor: str, source: str, timeout: float, dry_run: bool) -> dict[str, Any]:
+    entry = {"actor": actor, "source": source, "dry_run": dry_run, "timeout_seconds": timeout,
+             "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             "_started": time.time(), "stage": "启动中"}
+    RUNNING.setdefault(key, []).append(entry)
+    return entry
+
+
+def _track_stage(entry: dict[str, Any], stage: str) -> None:
+    entry["stage"] = stage
+
+
+def _track_finish(key: str, entry: dict[str, Any]) -> None:
+    rows = RUNNING.get(key)
+    if rows is None:
+        return
+    if entry in rows:
+        rows.remove(entry)
+    if not rows:
+        RUNNING.pop(key, None)
+
+
+async def invoke_tool(hub: Hub, catalog_key: str, inputs: dict[str, Any], actor: str = "agent",
+                      source: str = "rest") -> dict[str, Any]:
+    if not isinstance(inputs, dict):
+        raise WorkflowHubError(ErrorCode.INPUT_ERROR,
+                               f"inputs 需要 JSON 对象，收到：{type(inputs).__name__}",
+                               {"hint": '形如 {"argv": ["--version"], "dry_run": true}'})
     if catalog_key not in hub.catalog.tools:
         raise WorkflowHubError(ErrorCode.INPUT_ERROR, f"未知工具：{catalog_key}", {"catalog_key": catalog_key})
     record = hub.catalog.record(catalog_key) or {}
@@ -118,7 +192,8 @@ async def invoke_tool(hub: Hub, catalog_key: str, inputs: dict[str, Any], actor:
                                 "hint": "在工具库页面启用，或检查设置中的高风险工具开关"})
     if hub.catalog.needs_approval(catalog_key) and not inputs.get("approved"):
         approval = hub.catalog.create_approval(catalog_key, inputs, actor)
-        hub.catalog.audit({"type": "blocked_pending_approval", "tool": catalog_key, "actor": actor})
+        hub.catalog.audit({"type": "blocked_pending_approval", "tool": catalog_key, "actor": actor,
+                           "source": source})
         return {"status": "awaiting_approval", "approval": approval, "run_id": None,
                 "hint": "审批模式已开启：请在 WorkflowHub 窗口批准，然后带 approved=true 重试"}
 
@@ -127,17 +202,39 @@ async def invoke_tool(hub: Hub, catalog_key: str, inputs: dict[str, Any], actor:
     workflow = single_tool_workflow(skill.id, skill.version, declared, fields, catalog_key,
                                     record.get("title", catalog_key), timeout, names)
     started = time.time()
-    run = await hub.runner.run(workflow, fields)
+    # 并发是一条明说的策略，不是一个巧合：默认放开，标了 exclusive 的工具排队。
+    exclusive = bool(hub.catalog.state_for(catalog_key).get("exclusive")) and not inputs.get("dry_run")
+    entry = _track_start(catalog_key, actor, source, timeout, bool(inputs.get("dry_run")))
+    _track_stage(entry, "等待上一个调用" if exclusive else "执行中")
+    try:
+        if exclusive:
+            async with _tool_lock(catalog_key):
+                _track_stage(entry, "执行中")
+                run = await hub.runner.run(workflow, fields)
+        else:
+            run = await hub.runner.run(workflow, fields)
+    except asyncio.CancelledError:
+        # 取消也要留痕：否则审计里只看得到"从没发生过"，而命令可能已经跑了一半。
+        hub.catalog.audit({"type": "invoke", "tool": catalog_key, "actor": actor, "source": source,
+                           "status": "cancelled", "dry_run": bool(inputs.get("dry_run")),
+                           "duration_ms": int((time.time() - started) * 1000),
+                           "note": "调用方取消或服务退出；子进程已按进程树收掉"})
+        raise
+    finally:
+        _track_finish(catalog_key, entry)
     node_run = run.node_runs.get("call")
     result = node_run.result if node_run else None
     outputs = dict(result.outputs) if result else {}
     if result and result.error and run.error is None:
         run.error = result.error
     hub.catalog.audit({
-        "type": "invoke", "tool": catalog_key, "actor": actor, "run_id": run.id,
+        "type": "invoke", "tool": catalog_key, "actor": actor, "source": source, "run_id": run.id,
         "status": run.status.value, "exit_code": outputs.get("exit_code"),
         "command_line": outputs.get("command_line"), "dry_run": bool(inputs.get("dry_run")),
         "duration_ms": int((time.time() - started) * 1000),
+        "timeout_seconds": outputs.get("timeout_seconds"),
+        "cwd": outputs.get("cwd"),
+        "error_code": (result.error or run.error).code.value if (result.error or run.error) else None,
     })
     return {
         "status": run.status.value, "run_id": run.id, "trace_id": run.trace_id,
@@ -150,36 +247,77 @@ async def invoke_tool(hub: Hub, catalog_key: str, inputs: dict[str, Any], actor:
     }
 
 
-def start_background_invoke(hub: Hub, catalog_key: str, inputs: dict[str, Any], actor: str) -> dict[str, Any]:
+def start_background_invoke(hub: Hub, catalog_key: str, inputs: dict[str, Any], actor: str,
+                            source: str = "rest") -> dict[str, Any]:
     _prune_tasks()
     task_id = uuid4().hex[:12]
     TASKS[task_id] = {"id": task_id, "status": "running", "tool": catalog_key, "actor": actor,
-                      "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                      "source": source,
+                      "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                      "_started": time.time(), "stage": "已排队"}
 
     async def worker() -> None:
         try:
-            result = await invoke_tool(hub, catalog_key, inputs, actor)
+            TASKS[task_id]["stage"] = "执行中"
+            result = await invoke_tool(hub, catalog_key, inputs, actor, source)
             TASKS[task_id]["result"] = result
             TASKS[task_id]["status"] = result.get("status", "succeeded")
+            TASKS[task_id]["stage"] = result.get("status", "succeeded")
+        except asyncio.CancelledError:
+            TASKS[task_id]["status"] = "cancelled"
+            TASKS[task_id]["stage"] = "已取消"
+            TASKS[task_id]["error"] = ExecutionError(
+                code=ErrorCode.PERMISSION_ERROR, message="调用已被取消",
+                details={"hint": "子进程按进程树收掉了；要重跑请再发一次调用",
+                         "tool": catalog_key, "actor": actor}).model_dump(mode="json")
+            raise
         except WorkflowHubError as exc:
             TASKS[task_id]["status"] = "failed"
+            TASKS[task_id]["stage"] = "失败"
             TASKS[task_id]["error"] = exc.detail.model_dump(mode="json")
         except Exception as exc:
             TASKS[task_id]["status"] = "failed"
+            TASKS[task_id]["stage"] = "失败"
             TASKS[task_id]["error"] = ExecutionError(code=ErrorCode.UNKNOWN_ERROR,
                                                      message=f"{type(exc).__name__}: {exc}").model_dump(mode="json")
         TASKS[task_id]["_finished"] = time.time()
 
-    asyncio.create_task(worker())
+    TASKS[task_id]["_handle"] = asyncio.create_task(worker())
     return {"task_id": task_id, "status": "running", "poll": f"/api/v1/tasks/{task_id}",
-            "tool": catalog_key}
+            "tool": catalog_key, "cancel": f"/api/v1/tasks/{task_id}/cancel",
+            "note": "后台任务在 WorkflowHub 退出后会丢；结果落在 data/runs/ 可回看"}
+
+
+def cancel_task(task_id: str, actor: str = "ui") -> dict[str, Any] | None:
+    """真的取消：掐协程 → CommandExecutor 收到 CancelledError → 按进程树杀子进程。
+
+    返回 None 表示没有这个任务（由调用方给 404）。
+    """
+    task = TASKS.get(task_id)
+    if task is None:
+        return None
+    if task.get("_finished"):
+        return {**task_state(task_id or ""), "cancelled": False,
+                "reason": f"任务已经结束（{task.get('status')}），取消太晚了"}
+    handle = task.get("_handle")
+    if handle is None or handle.done():
+        task["status"] = "cancelled"
+        return {**task_state(task_id), "cancelled": True}
+    handle.cancel()
+    task["status"] = "cancelling"
+    task["stage"] = "取消中"
+    return {**task_state(task_id), "cancelled": True, "actor": actor,
+            "note": "已取消；子进程连同它自己派生的进程一起收掉"}
 
 
 def task_state(task_id: str) -> dict[str, Any] | None:
     task = TASKS.get(task_id)
     if task is None:
         return None
-    return {k: v for k, v in task.items() if not k.startswith("_")}
+    out = {k: v for k, v in task.items() if not k.startswith("_") and k != "_handle"}
+    if task.get("_started"):
+        out["elapsed_seconds"] = round(time.time() - task["_started"], 1)
+    return out
 
 
 def snippets(base_url: str, catalog_key: str, skill_id: str, inputs: dict[str, Any]) -> dict[str, str]:
