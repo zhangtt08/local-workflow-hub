@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from .bootstrap import Hub
 from .errors import WorkflowHubError
+from .local_guard import TOKEN_HEADER, token_path
 from .models import ErrorCode
 from . import services
 
@@ -208,6 +209,10 @@ def create_router(hub: Hub, started_at: float | None = None) -> APIRouter:
                 },
                 "gates": {"approval_mode": hub.catalog.settings["approval_mode"],
                           "high_risk_enabled": hub.catalog.settings["high_risk_enabled"]},
+                # 令牌自发现：非 GET 必带 X-WorkflowHub-Token（默认必配，见 local_boundary），
+                # 验收器与 MCP 客户端按这段拿到钥匙，不用猜路径。
+                "api": {"token_header": TOKEN_HEADER,
+                        "token_file": str(token_path(hub.roots["data"]))},
             },
         }
 

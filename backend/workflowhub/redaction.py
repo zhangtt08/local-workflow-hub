@@ -58,7 +58,12 @@ _SECRET_SCHEME = re.compile(r"(?P<flag>\b(?:Bearer|Basic|Digest|Token)\s+)(?P<va
 #: 放在 ``logs[0]``（`command_executor.py`），按名字豁免就等于把 `--password 值` 原样送给调用方。
 #: 现在它不在名单里：日志按普通字符串走命令行的那条遮法（旗标留着、值遮掉）。
 PASSTHROUGH_KEYS = {"stdin", "stdout", "stderr", "partial_stdout", "partial_stderr",
-                    "text", "content", "body", "output", "file_path", "path"}
+                    "text", "content", "body", "output", "file_path", "path",
+                    # Agent API 的令牌发现元数据（AGENT_API_STANDARD.md「本机守卫」第 4 条）：
+                    # manifest 的 api 段必须公布"头名"与"令牌文件路径"，调用方才拿得到钥匙。
+                    # 这三个键的值是头名（x-workflowhub-token）与文件路径，永远不是令牌值本身 ——
+                    # 令牌值仍按"名字带 token"与 argv/回声那几道照遮不误。
+                    "token_header", "token_env", "token_file"}
 
 #: 这些键的值是 argv 形状的列表：旗标与它的值分在相邻两项里，逐条判名字判不出来。
 #: `value` 也在名单里：Workflow 的**字面量绑定**长这样 `{"type":"literal","value":["--token","值"]}`，
