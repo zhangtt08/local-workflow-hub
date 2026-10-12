@@ -21,3 +21,5 @@ build/
 .env.*
 !.env.example
 agent/.endpoint
+
+*.exe
